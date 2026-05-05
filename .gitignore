@@ -189,3 +189,32 @@ uploadFile
 videoFile
 
 /uploader/bilibili_uploader/qrcode.png
+
+# ============================================================
+# 调试 / 临时文件（开发过程产生，不应入库）
+# ============================================================
+
+# 调试/测试脚本
+_test_*.py
+_diag_*.py
+_check_*.py
+_e2e_*.py
+_verify_*.py
+
+# 临时 JS / HTML 抓包
+_temp_*.*
+_tencent_frame*.html
+
+# 日志文件
+*_log.txt
+
+# 调试截图（以 _ 开头的）
+_*.png
+
+# 非项目资源
+wallpapers/
+generated-images/
+
+# 工作区记忆（WorkBuddy 内部）
+.workbuddy/
+

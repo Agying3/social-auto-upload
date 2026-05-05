@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 from loguru import logger
 
-from conf import BASE_DIR
+from conf import BASE_DIR, DATA_DIR
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -39,15 +39,20 @@ def create_logger(log_name: str, file_path: str):
     def filter_record(record):
         return record["extra"].get("business_name") == log_name
 
-    Path(BASE_DIR / file_path).parent.mkdir(exist_ok=True)
-    logger.add(Path(BASE_DIR / file_path), filter=filter_record, level="INFO", rotation="10 MB", retention="10 days", backtrace=True, diagnose=True)
+    log_file = DATA_DIR / file_path
+    log_file.parent.mkdir(exist_ok=True)
+    logger.add(str(log_file), filter=filter_record, level="INFO", rotation="10 MB", retention="10 days", backtrace=True, diagnose=True)
     return logger.bind(business_name=log_name)
 
 
 # Remove all existing handlers
 logger.remove()
-# Add a standard console handler
-logger.add(sys.stdout, colorize=True, format=log_formatter)
+# Add a standard console handler（console=False 模式下 sys.stdout 可能无效，跳过）
+if sys.stdout is not None and hasattr(sys.stdout, "write"):
+    try:
+        logger.add(sys.stdout, colorize=True, format=log_formatter)
+    except Exception:
+        pass  # 忽略 console=False 模式下的 stdout 问题
 
 douyin_logger = create_logger('douyin', 'logs/douyin.log')
 tencent_logger = create_logger('tencent', 'logs/tencent.log')

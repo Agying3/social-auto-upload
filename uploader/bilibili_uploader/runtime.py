@@ -179,7 +179,11 @@ def run_biliup_command(arguments: list[str], interactive: bool = False) -> subpr
     binary_path = ensure_biliup_binary(force_check=False)
     command = [str(binary_path), *arguments]
     if interactive:
-        return subprocess.run(command, check=False)
+        # 交互式登录需要独立的控制台窗口（特别是打包为 GUI 应用时）
+        kwargs = {}
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        return subprocess.run(command, check=False, **kwargs)
     return subprocess.run(
         command,
         check=False,

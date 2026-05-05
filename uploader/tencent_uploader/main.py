@@ -66,7 +66,10 @@ def _build_login_result(
 
 
 def _build_launch_kwargs(headless: bool) -> dict:
-    launch_kwargs = {"headless": headless}
+    launch_kwargs = {
+        "headless": headless,
+        "args": ["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox", "--disable-extensions", "--disable-software-rasterizer"],
+    }
     if LOCAL_CHROME_PATH:
         launch_kwargs["executable_path"] = LOCAL_CHROME_PATH
     else:
@@ -111,21 +114,65 @@ async def cookie_auth(account_file):
             context = await browser.new_context(storage_state=account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await page.goto(TENCENT_UPLOAD_URL)
-            await page.wait_for_url(TENCENT_UPLOAD_URL, timeout=5000)
+            await page.goto("https://channels.weixin.qq.com/platform")
+            # 等待页面加载（Wujie 微前端需要时间渲染）
+            await asyncio.sleep(8)
 
-            login_markers = [
-                page.get_by_text("扫码登录", exact=True).first,
-                page.get_by_text("发表视频", exact=True).first,
-                page.get_by_role("button", name="发表").first,
-            ]
+            # 方法 1：检查 Wujie shadow DOM
+            login_status = await page.evaluate("""() => {
+                const wujieApp = document.querySelector('wujie-app');
+                if (!wujieApp || !wujieApp.shadowRoot) {
+                    return { hasWujie: false, needLogin: null };
+                }
 
-            if await login_markers[0].count():
+                const sr = wujieApp.shadowRoot;
+
+                // 检查是否有扫码登录提示
+                const loginElements = sr.querySelectorAll('*');
+                for (const el of loginElements) {
+                    const text = (el.textContent || '').trim();
+                    if (text.includes('扫码登录') && el.offsetWidth > 0) {
+                        return { hasWujie: true, needLogin: true };
+                    }
+                }
+
+                // 检查是否有发表视频按钮（已登录标志）
+                const buttons = sr.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').trim();
+                    if (text.includes('发表视频') || text.includes('发表')) {
+                        return { hasWujie: true, needLogin: false };
+                    }
+                }
+
+                return { hasWujie: true, needLogin: null };
+            }""")
+
+            # 如果 shadow DOM 明确判断了登录状态，直接返回
+            if login_status.get("needLogin") is True:
+                tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
+                return False
+            if login_status.get("needLogin") is False:
+                tencent_logger.success(_msg("🥳", "cookie 有效"))
+                return True
+
+            # 方法 2：降级到传统页面选择器
+            if await page.get_by_text("扫码登录", exact=True).count():
                 tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
                 return False
 
-            tencent_logger.success(_msg("🥳", "cookie 有效"))
-            return True
+            # 如果有「发表视频」文字或「发表」按钮，说明已登录
+            if await page.get_by_text("发表视频", exact=True).count():
+                tencent_logger.success(_msg("🥳", "cookie 有效"))
+                return True
+
+            if await page.get_by_role("button", name="发表").count():
+                tencent_logger.success(_msg("🥳", "cookie 有效"))
+                return True
+
+            # 无法确定，按失效处理
+            tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
+            return False
         except Exception as exc:
             tencent_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
             return False
@@ -134,17 +181,40 @@ async def cookie_auth(account_file):
 
 
 async def _extract_tencent_qrcode_src(page: Page) -> str:
+    """提取登录二维码 - 支持 Wujie shadow DOM 和传统页面"""
+
+    # 优先检查 Wujie shadow DOM 中的二维码
+    qrcode_src = await page.evaluate("""() => {
+        const wujieApp = document.querySelector('wujie-app');
+        if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+        const sr = wujieApp.shadowRoot;
+        const imgs = sr.querySelectorAll('img');
+        for (const img of imgs) {
+            const src = img.getAttribute('src') || '';
+            if (src.startsWith('data:image/') && img.offsetWidth > 50) {
+                return src;
+            }
+        }
+        return null;
+    }""")
+
+    if qrcode_src:
+        return qrcode_src
+
+    # 传统 iframe 方式
     if hasattr(page, "frame_locator"):
         try:
             iframe_locator = page.frame_locator('[src*="login-for-iframe"]')
             qr_code_img = iframe_locator.locator('div#app img.qrcode').first
-            await qr_code_img.wait_for(state="visible", timeout=30000)
+            await qr_code_img.wait_for(state="visible", timeout=15000)
             src = await qr_code_img.get_attribute("src")
             if src and src.startswith("data:image/"):
                 return src
         except Exception:
             pass
 
+    # 降级到直接页面选择器
     selector_candidates = [
         "div.login-qrcode-wrap img.qrcode",
         "div.qrcode-wrap img.qrcode",
@@ -197,6 +267,41 @@ async def _save_tencent_qrcode(page: Page, account_file: str, previous_qrcode_pa
 
 
 async def _is_tencent_login_completed(page: Page) -> bool:
+    """检查是否登录完成 - 同时检查 Wujie shadow DOM 和传统页面"""
+    # 先检查 Wujie shadow DOM
+    login_completed = await page.evaluate("""() => {
+        const wujieApp = document.querySelector('wujie-app');
+        if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+        const sr = wujieApp.shadowRoot;
+
+        // 检查是否有发表视频按钮（已登录标志）
+        const buttons = sr.querySelectorAll('button');
+        for (const btn of buttons) {
+            const text = (btn.textContent || '').trim();
+            if (text.includes('发表视频') || text.includes('发表')) {
+                return true;
+            }
+        }
+
+        // 检查是否有扫码登录（未登录标志）
+        const allEls = sr.querySelectorAll('*');
+        for (const el of allEls) {
+            const text = (el.textContent || '').trim();
+            if (text.includes('扫码登录') && el.offsetWidth > 0) {
+                return false;
+            }
+        }
+
+        return null;  // 不确定
+    }""")
+
+    if login_completed is True:
+        return True
+    if login_completed is False:
+        return False
+
+    # 降级到传统页面检查
     publish_markers = [
         page.locator('div:has-text("发表视频")').first,
         page.locator('button:has-text("发表")').first,
@@ -246,6 +351,27 @@ async def _is_tencent_qrcode_expired(page: Page) -> bool:
 
 
 async def _is_tencent_qrcode_scanned(page: Page) -> bool:
+    """检查二维码是否已被扫描 - 支持 Wujie shadow DOM"""
+    # 先检查 shadow DOM
+    scanned = await page.evaluate("""() => {
+        const wujieApp = document.querySelector('wujie-app');
+        if (!wujieApp || !wujieApp.shadowRoot) return false;
+
+        const sr = wujieApp.shadowRoot;
+        const allEls = sr.querySelectorAll('*');
+        for (const el of allEls) {
+            const text = (el.textContent || '').trim();
+            if ((text.includes('已扫码') || text.includes('确认')) && el.offsetWidth > 0) {
+                return true;
+            }
+        }
+        return false;
+    }""")
+
+    if scanned:
+        return True
+
+    # 降级到传统选择器
     scanned_tips = [
         'div.qr-tip div:has-text("已扫码")',
         'div.qr-tip div:has-text("需在手机上进行确认")',
@@ -261,6 +387,35 @@ async def _is_tencent_qrcode_scanned(page: Page) -> bool:
 
 
 async def _refresh_tencent_qrcode(page: Page) -> None:
+    """刷新过期二维码 - 支持 Wujie shadow DOM"""
+    # 先在 shadow DOM 中查找刷新按钮
+    refresh_info = await page.evaluate("""() => {
+        const wujieApp = document.querySelector('wujie-app');
+        if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+        const sr = wujieApp.shadowRoot;
+        const allEls = sr.querySelectorAll('*');
+        for (const el of allEls) {
+            const text = (el.textContent || '').trim();
+            if ((text.includes('刷新') || text.includes('重新获取')) && el.offsetWidth > 0) {
+                const style = getComputedStyle(el);
+                if (style.cursor === 'pointer') {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + rect.height / 2),
+                    };
+                }
+            }
+        }
+        return null;
+    }""")
+
+    if refresh_info:
+        await page.mouse.click(refresh_info['x'], refresh_info['y'])
+        return
+
+    # 降级到传统选择器
     visible_refresh_selectors = [
         "div.login-qrcode-wrap div.mask.show div.refresh-wrap",
         "div.login-qrcode-wrap div.mask.show .refresh-wrap",
@@ -471,145 +626,510 @@ class TencentBaseUploader(BaseVideoUploader):
             self.publish_date = 0
 
     async def set_schedule_time_tencent(self, page: Page, publish_date: datetime):
-        label_element = page.locator("label").filter(has_text="定时").nth(1)
-        await label_element.click()
-        await page.click('input[placeholder="请选择发表时间"]')
+        """设置定时发表 - 在 Wujie shadow DOM 中查找定时选项"""
+        try:
+            # 在 shadow DOM 中查找「定时」选项
+            schedule_info = await page.evaluate("""() => {
+                const wujieApp = document.querySelector('wujie-app');
+                if (!wujieApp || !wujieApp.shadowRoot) return null;
 
-        current_month = publish_date.strftime("%m月")
-        page_month = await page.inner_text('span.weui-desktop-picker__panel__label:has-text("月")')
-        if page_month != current_month:
-            await page.click("button.weui-desktop-btn__icon__right")
+                const sr = wujieApp.shadowRoot;
+                const allEls = sr.querySelectorAll('*');
+                for (const el of allEls) {
+                    const text = (el.textContent || '').trim();
+                    if (text === '定时' && el.offsetWidth > 0) {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            x: Math.round(rect.x + rect.width / 2),
+                            y: Math.round(rect.y + rect.height / 2),
+                        };
+                    }
+                }
+                return null;
+            }""")
 
-        elements = await page.query_selector_all("table.weui-desktop-picker__table a")
-        for element in elements:
-            if "weui-desktop-picker__disabled" in await element.evaluate("el => el.className"):
-                continue
-            text = await element.inner_text()
-            if text.strip() == str(publish_date.day):
-                await element.click()
-                break
+            if schedule_info:
+                await page.mouse.click(schedule_info['x'], schedule_info['y'])
+                await asyncio.sleep(1)
+                # 点击时间输入框
+                time_input_info = await page.evaluate("""() => {
+                    const wujieApp = document.querySelector('wujie-app');
+                    if (!wujieApp || !wujieApp.shadowRoot) return null;
 
-        await page.click('input[placeholder="请选择时间"]')
-        await page.keyboard.press("Control+KeyA")
-        await page.keyboard.type(publish_date.strftime("%H"))
-        await page.locator("div.input-editor").click()
+                    const sr = wujieApp.shadowRoot;
+                    const inputs = sr.querySelectorAll('input');
+                    for (const inp of inputs) {
+                        const ph = (inp.placeholder || '');
+                        if (ph.includes('时间') || ph.includes('日期')) {
+                            const rect = inp.getBoundingClientRect();
+                            return {
+                                x: Math.round(rect.x + rect.width / 2),
+                                y: Math.round(rect.y + rect.height / 2),
+                            };
+                        }
+                    }
+                    return null;
+                }""")
+
+                if time_input_info:
+                    await page.mouse.click(time_input_info['x'], time_input_info['y'])
+                    await page.keyboard.press("Control+KeyA")
+                    await page.keyboard.type(publish_date.strftime("%Y-%m-%d %H:%M"))
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(1)
+            else:
+                # 降级方案
+                label_element = page.locator("label").filter(has_text="定时").nth(1)
+                if await label_element.count():
+                    await label_element.click()
+        except Exception as e:
+            tencent_logger.warning(_msg("😵", f"设置定时发表失败: {e}"))
 
     async def open_upload_page(self, page: Page) -> None:
-        await page.goto(TENCENT_UPLOAD_URL)
-        await page.wait_for_url(TENCENT_UPLOAD_URL)
+        """打开上传页面 - 必须先导航到 /platform，然后点击「发表视频」进入上传表单。
+        
+        直接导航到 /platform/post/create 不会触发 Wujie 子应用渲染上传表单，
+        必须通过点击「发表视频」按钮来进入上传页面。
+        """
+        await page.goto("https://channels.weixin.qq.com/platform")
+        # 等待 Wujie shadow DOM 渲染「发表视频」按钮（需要足够时间加载微前端）
+        # 渐进式等待：每秒检查一次，最多 15 秒
+        for _ in range(15):
+            has_publish_btn = await page.evaluate("""() => {
+                const wujieApp = document.querySelector('wujie-app');
+                if (!wujieApp || !wujieApp.shadowRoot) return false;
+                const sr = wujieApp.shadowRoot;
+                const buttons = sr.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').trim();
+                    if (text.includes('发表视频') || text.includes('发表')) {
+                        return btn.offsetWidth > 0;
+                    }
+                }
+                return false;
+            }""")
+            if has_publish_btn:
+                break
+            await asyncio.sleep(1)
+
+    async def _dismiss_guide_popups(self, page: Page) -> None:
+        """关闭视频号 Wujie Shadow DOM 中的引导弹窗（'我知道了'等）"""
+        for round_idx in range(3):  # 最多关闭 3 轮弹窗
+            dismissed = await page.evaluate("""() => {
+                const app = document.querySelector('wujie-app');
+                if (!app || !app.shadowRoot) return 0;
+                const sr = app.shadowRoot;
+                let count = 0;
+                // 只点击"我知道了"等确认按钮来关闭弹窗
+                // ⚠️ 不要用 .remove() 删除 overlay 元素，可能误删 Wujie 的渲染容器
+                const btns = sr.querySelectorAll('button');
+                for (const btn of btns) {
+                    const text = (btn.textContent || '').trim();
+                    if (text.includes('我知道了') || text.includes('知道了') || text.includes('关闭') || text.includes('下一步')) {
+                        btn.click();
+                        count++;
+                    }
+                }
+                return count;
+            }""")
+            if dismissed > 0:
+                tencent_logger.info(_msg("🧹", f"关闭了 {dismissed} 个引导弹窗（第{round_idx+1}轮）"))
+                await asyncio.sleep(0.5)
+            else:
+                break
+
+    async def _click_publish_video_button(self, page: Page) -> None:
+        """在 Wujie shadow DOM 中点击「发表视频」按钮，进入上传表单页面"""
+        # 先关闭可能存在的引导弹窗
+        await self._dismiss_guide_popups(page)
+
+        # 直接在 JS 中点击按钮（比 mouse.click 更可靠，避免 Shadow DOM 点击分发问题）
+        click_result = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return { found: false, reason: 'no wujie shadowRoot' };
+
+            const sr = wujieApp.shadowRoot;
+            const buttons = sr.querySelectorAll('button');
+            for (const btn of buttons) {
+                const text = (btn.textContent || '').trim();
+                if (text.includes('发表视频') || text === '发表') {
+                    const rect = btn.getBoundingClientRect();
+                    // 直接用 JS click 而非返回坐标用 mouse.click
+                    btn.click();
+                    return { found: true, text: text, x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+                }
+            }
+            // 列出所有按钮文本以便调试
+            const allTexts = Array.from(buttons).map(b => (b.textContent || '').trim().substring(0, 20));
+            return { found: false, allBtns: allTexts };
+        }""")
+
+        if click_result and click_result.get('found'):
+            tencent_logger.info(_msg("🧭", f"找到「{click_result['text']}」按钮，点击进入上传页"))
+        else:
+            tencent_logger.warning(_msg("😵", f"未找到「发表视频」按钮: {click_result}"))
+            # 降级：尝试 mouse.click 默认坐标
+            await page.mouse.click(1228, 505)
+            await asyncio.sleep(3)
+
+        # 等待 URL 变化到上传页面 + Wujie 子应用渲染上传表单
+        await asyncio.sleep(4)
+        # 验证上传表单是否渲染
+        for attempt in range(15):
+            has_upload = await page.evaluate("""() => {
+                const wujieApp = document.querySelector('wujie-app');
+                if (!wujieApp || !wujieApp.shadowRoot) return false;
+                const sr = wujieApp.shadowRoot;
+                return sr.querySelectorAll('.ant-upload').length > 0 ||
+                       sr.querySelectorAll('input[type="file"]').length > 0;
+            }""")
+            if has_upload:
+                tencent_logger.info(_msg("✅", "上传表单已渲染"))
+                return
+            await asyncio.sleep(1)
+        tencent_logger.warning(_msg("⚠️", "点击「发表视频」后未检测到上传表单，继续尝试"))
 
     async def upload_video_file(self, page: Page, file_path: str) -> None:
-        file_input = page.locator('input[type="file"]')
-        await file_input.set_input_files(file_path)
+        """通过 file_chooser 上传视频文件（Wujie shadow DOM 方式）"""
+        # 先点击「发表视频」按钮进入上传表单
+        await self._click_publish_video_button(page)
+
+        # 在 Wujie shadow DOM 中找到 ant-upload-drag 区域并点击
+        upload_area_info = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+            const sr = wujieApp.shadowRoot;
+            const uploadAreas = sr.querySelectorAll('.ant-upload-drag, .ant-upload');
+            for (const area of uploadAreas) {
+                const rect = area.getBoundingClientRect();
+                if (rect.width > 50 && rect.height > 50) {
+                    return {
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + rect.height / 2),
+                        className: (area.className || '').toString().substring(0, 60),
+                    };
+                }
+            }
+            return null;
+        }""")
+
+        if upload_area_info:
+            tencent_logger.info(_msg("📤", f"找到上传区域，点击选择文件: {upload_area_info['className']}"))
+            # 等待一小段时间确保 Shadow DOM 内的 JS 事件绑定完成
+            await asyncio.sleep(1)
+            try:
+                async with page.expect_file_chooser(timeout=10000) as fc_info:
+                    await page.mouse.click(upload_area_info['x'], upload_area_info['y'])
+                file_chooser = await fc_info.value
+                await file_chooser.set_files(file_path)
+                tencent_logger.info(_msg("✅", "视频文件已选择"))
+            except Exception as e:
+                tencent_logger.warning(_msg("⚠️", f"file_chooser 触发失败，尝试 CDP 方式: {e}"))
+                # 降级方案：使用 CDP (Chrome DevTools Protocol) 直接设置 Shadow DOM 中的 file input
+                try:
+                    cdp = await page.context.new_cdp_session(page)
+                    doc = await cdp.send("DOM.getDocument", {"depth": -1, "pierce": True})
+                    nodes = await cdp.send("DOM.querySelectorAll", {
+                        "nodeId": doc["root"]["nodeId"],
+                        "selector": "input[type='file']"
+                    })
+                    node_ids = nodes.get("nodeIds", [])
+                    if node_ids:
+                        await cdp.send("DOM.setFileInputFiles", {
+                            "files": [file_path],
+                            "nodeId": node_ids[0],
+                        })
+                        tencent_logger.info(_msg("✅", "通过 CDP 方式设置视频文件成功"))
+                    else:
+                        raise RuntimeError("CDP 未找到 input[type=file] 元素")
+                except Exception as cdp_err:
+                    raise RuntimeError(f"file_chooser 和 CDP 方式均失败: {e} / {cdp_err}")
+        else:
+            # 降级方案：尝试传统的 input[type=file]
+            tencent_logger.warning(_msg("😵", "未找到 Wujie 上传区域，尝试传统 file input"))
+            file_input = page.locator('input[type="file"]')
+            if await file_input.count():
+                await file_input.set_input_files(file_path)
+            else:
+                raise RuntimeError("无法找到视频上传入口，请检查视频号页面结构是否变更")
 
     async def set_short_title(self, page: Page, title: str, short_title: str | None = None) -> None:
-        short_title_element = (
-            page.get_by_text("短标题", exact=True)
-            .locator("..")
-            .locator("xpath=following-sibling::div")
-            .locator('span input[type="text"]')
-        )
-        if await short_title_element.count():
-            await short_title_element.fill(short_title or format_str_for_short_title(title))
+        """设置短标题 - 在 Wujie shadow DOM 中查找输入框"""
+        input_info = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+            const sr = wujieApp.shadowRoot;
+            // 查找短标题输入框（placeholder 包含"6-16"）
+            const inputs = sr.querySelectorAll('input[type="text"]');
+            for (const inp of inputs) {
+                const ph = (inp.placeholder || '').toLowerCase();
+                if (ph.includes('6-16') || ph.includes('概括') || ph.includes('短标题')) {
+                    const rect = inp.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + rect.height / 2),
+                        placeholder: inp.placeholder || '',
+                    };
+                }
+            }
+            return null;
+        }""")
+
+        if input_info:
+            tencent_logger.info(_msg("📝", f"找到短标题输入框: {input_info['placeholder']}"))
+            await page.mouse.click(input_info['x'], input_info['y'])
+            await asyncio.sleep(0.5)
+            await page.keyboard.press("Control+KeyA")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.type(short_title or format_str_for_short_title(title))
+        else:
+            # 降级方案
+            tencent_logger.warning(_msg("😵", "未找到短标题输入框，尝试传统选择器"))
+            short_title_element = (
+                page.get_by_text("短标题", exact=True)
+                .locator("..")
+                .locator("xpath=following-sibling::div")
+                .locator('span input[type="text"]')
+            )
+            if await short_title_element.count():
+                await short_title_element.fill(short_title or format_str_for_short_title(title))
 
     async def fill_title_and_tags(self, page: Page) -> None:
-        await page.locator("div.input-editor").click()
-        await page.keyboard.type(self.title)
-        await page.keyboard.press("Enter")
-        for tag in self.tags:
-            await page.keyboard.type("#" + tag)
-            await page.keyboard.press("Space")
-        tencent_logger.info(_msg("🏷️", f"成功添加 hashtag: {len(self.tags)}"))
+        """填写标题和标签 - 在 Wujie shadow DOM 中查找编辑区域"""
+        # 查找标题/描述编辑区域
+        editor_info = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+            const sr = wujieApp.shadowRoot;
+            // 查找 contenteditable 或 div.input-editor
+            const editors = sr.querySelectorAll('[contenteditable="true"], .input-editor');
+            for (const el of editors) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 50 && rect.height > 20) {
+                    return {
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + 10),
+                        className: (el.className || '').toString().substring(0, 60),
+                    };
+                }
+            }
+            return null;
+        }""")
+
+        if editor_info:
+            tencent_logger.info(_msg("📝", f"找到标题编辑区域: {editor_info['className']}"))
+            await page.mouse.click(editor_info['x'], editor_info['y'])
+            await asyncio.sleep(0.5)
+            await page.keyboard.type(self.title)
+            await page.keyboard.press("Enter")
+            for tag in self.tags:
+                await page.keyboard.type("#" + tag)
+                await page.keyboard.press("Space")
+            tencent_logger.info(_msg("🏷️", f"成功添加 hashtag: {len(self.tags)}"))
+        else:
+            # 降级方案
+            tencent_logger.warning(_msg("😵", "未找到标题编辑区域，尝试传统选择器"))
+            await page.locator("div.input-editor").click()
+            await page.keyboard.type(self.title)
+            await page.keyboard.press("Enter")
+            for tag in self.tags:
+                await page.keyboard.type("#" + tag)
+                await page.keyboard.press("Space")
+            tencent_logger.info(_msg("🏷️", f"成功添加 hashtag: {len(self.tags)}"))
 
     async def fill_description(self, page: Page) -> None:
+        """填写描述 - 在标题输入后，按 Enter 然后输入描述"""
         await page.keyboard.press("Enter")
         await page.keyboard.type(self.desc)
-        tencent_logger.info(_msg("🏷️", f"成功添加 desc: {len(self.desc)}"))
+        tencent_logger.info(_msg("📝", f"成功添加 desc: {len(self.desc)}"))
 
     async def apply_collection(self, page: Page) -> None:
-        collection_elements = (
-            page.get_by_text("添加到合集")
-            .locator("xpath=following-sibling::div")
-            .locator(".option-list-wrap > div")
-        )
-        if await collection_elements.count() > 1:
-            await page.get_by_text("添加到合集").locator("xpath=following-sibling::div").click()
-            await collection_elements.first.click()
+        """添加到合集 - 在 Wujie shadow DOM 中查找"""
+        collection_info = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+            const sr = wujieApp.shadowRoot;
+            const allEls = sr.querySelectorAll('*');
+            for (const el of allEls) {
+                const text = (el.textContent || '').trim();
+                if (text.includes('添加到合集') && el.offsetWidth > 0) {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        text: text.substring(0, 30),
+                    };
+                }
+            }
+            return null;
+        }""")
+
+        if not collection_info:
+            return
+
+        # 降级方案 - 尝试传统选择器
+        try:
+            collection_elements = (
+                page.get_by_text("添加到合集")
+                .locator("xpath=following-sibling::div")
+                .locator(".option-list-wrap > div")
+            )
+            if await collection_elements.count() > 1:
+                await page.get_by_text("添加到合集").locator("xpath=following-sibling::div").click()
+                await collection_elements.first.click()
+        except Exception:
+            tencent_logger.debug(_msg("🧍", "合集操作跳过"))
 
     async def apply_original_statement(self, page: Page) -> None:
-        if await page.get_by_label("视频为原创").count():
-            await page.get_by_label("视频为原创").check()
-
+        """声明原创 - 在 Wujie shadow DOM 中查找"""
         try:
-            label_locator = await page.locator('label:has-text("我已阅读并同意 《视频号原创声明使用条款》")').is_visible()
-        except Exception:
-            label_locator = False
+            # 尝试在 shadow DOM 中找到原创声明复选框
+            checkbox_info = await page.evaluate("""() => {
+                const wujieApp = document.querySelector('wujie-app');
+                if (!wujieApp || !wujieApp.shadowRoot) return null;
 
-        if label_locator:
-            await page.get_by_label("我已阅读并同意 《视频号原创声明使用条款》").check()
-            await page.get_by_role("button", name="声明原创").click()
+                const sr = wujieApp.shadowRoot;
+                const checkboxes = sr.querySelectorAll('input[type="checkbox"]');
+                for (const cb of checkboxes) {
+                    const parent = cb.closest('label, .ant-checkbox-wrapper');
+                    const text = parent ? (parent.textContent || '').trim() : '';
+                    if (text.includes('原创') || text.includes('声明')) {
+                        const rect = cb.getBoundingClientRect();
+                        return {
+                            x: Math.round(rect.x + rect.width / 2),
+                            y: Math.round(rect.y + rect.height / 2),
+                            text: text.substring(0, 50),
+                        };
+                    }
+                }
+                return null;
+            }""")
 
-        if await page.locator('div.label span:has-text("声明原创")').count() and getattr(self, "category", None):
-            if not await page.locator("div.declare-original-checkbox input.ant-checkbox-input").is_disabled():
-                await page.locator("div.declare-original-checkbox input.ant-checkbox-input").click()
-                checked_locator = page.locator(
-                    "div.declare-original-dialog "
-                    "label.ant-checkbox-wrapper.ant-checkbox-wrapper-checked:visible"
-                )
-                if not await checked_locator.count():
-                    await page.locator("div.declare-original-dialog input.ant-checkbox-input:visible").click()
-
-            original_type_form = page.locator('div.original-type-form > div.form-label:has-text("原创类型"):visible')
-            if await original_type_form.count():
-                await page.locator("div.form-content:visible").click()
-                await page.locator(
-                    "div.form-content:visible "
-                    "ul.weui-desktop-dropdown__list "
-                    f'li.weui-desktop-dropdown__list-ele:has-text("{self.category}")'
-                ).first.click()
-                await page.wait_for_timeout(1000)
-
-            declare_button = page.locator('button:has-text("声明原创"):visible')
-            if await declare_button.count():
-                await declare_button.click()
+            if checkbox_info:
+                tencent_logger.info(_msg("📝", f"找到原创声明选项: {checkbox_info['text']}"))
+                await page.mouse.click(checkbox_info['x'], checkbox_info['y'])
+                await asyncio.sleep(1)
+        except Exception as e:
+            tencent_logger.debug(_msg("🧍", f"原创声明操作跳过: {e}"))
 
     async def wait_for_upload_complete(self, page: Page) -> None:
+        """等待视频上传完成 - 检查 Wujie shadow DOM 中的上传进度"""
         while True:
             try:
-                publish_button = page.get_by_role("button", name="发表")
-                button_class = await publish_button.get_attribute("class")
-                if button_class and "weui-desktop-btn_disabled" not in button_class:
+                # 在 shadow DOM 中查找发表按钮状态
+                publish_btn_info = await page.evaluate("""() => {
+                    const wujieApp = document.querySelector('wujie-app');
+                    if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+                    const sr = wujieApp.shadowRoot;
+                    const buttons = sr.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || '').trim();
+                        if (text === '发表') {
+                            const rect = btn.getBoundingClientRect();
+                            const disabled = btn.disabled || btn.className.includes('disabled');
+                            return {
+                                disabled: disabled,
+                                x: Math.round(rect.x + rect.width / 2),
+                                y: Math.round(rect.y + rect.height / 2),
+                                text: text,
+                            };
+                        }
+                    }
+                    return null;
+                }""")
+
+                if publish_btn_info and not publish_btn_info['disabled']:
                     tencent_logger.info(_msg("🥳", "视频上传完毕"))
                     break
 
-                tencent_logger.info(_msg("🏃", "正在上传视频中..."))
-                await asyncio.sleep(2)
+                # 检查上传错误
+                error_info = await page.evaluate("""() => {
+                    const wujieApp = document.querySelector('wujie-app');
+                    if (!wujieApp || !wujieApp.shadowRoot) return false;
 
-                upload_failed = await page.locator("div.status-msg.error").count()
-                delete_button = await page.locator('div.media-status-content div.tag-inner:has-text("删除")').count()
-                if upload_failed and delete_button:
+                    const sr = wujieApp.shadowRoot;
+                    const errorEls = sr.querySelectorAll('.status-msg.error, .upload-error');
+                    return errorEls.length > 0;
+                }""")
+
+                if error_info:
                     tencent_logger.error(_msg("😵", "发现上传出错了，准备重试"))
                     await self.handle_upload_error(page)
+
+                tencent_logger.info(_msg("🏃", "正在上传视频中..."))
+                await asyncio.sleep(2)
             except Exception:
                 tencent_logger.info(_msg("🏃", "正在上传视频中..."))
                 await asyncio.sleep(2)
 
     async def submit_publish(self, page: Page) -> None:
+        """提交发布 - 在 Wujie shadow DOM 中查找并点击发表按钮"""
+        max_wait = 180  # 最多等待 180 秒
+        start_time = asyncio.get_event_loop().time()
         while True:
-            try:
-                if getattr(self, "is_draft", False):
-                    draft_button = page.locator('div.form-btns button:has-text("保存草稿")')
-                    if await draft_button.count():
-                        await draft_button.click()
-                    await page.wait_for_url("**/post/list**", timeout=5000)
-                    tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
-                else:
-                    publish_button = page.locator('div.form-btns button:has-text("发表")')
-                    if await publish_button.count():
-                        await publish_button.click()
-                    await page.wait_for_url(TENCENT_MANAGE_URL, timeout=5000)
-                    tencent_logger.success(_msg("🥳", "视频发布成功"))
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > max_wait:
+                tencent_logger.error(_msg("😵", f"发布超时（{max_wait}秒），可能被平台拦截"))
                 break
+            try:
+                # 在 shadow DOM 中查找发表按钮并用 JS click 点击
+                is_draft = getattr(self, "is_draft", False)
+                publish_result = await page.evaluate(f"""() => {{
+                    const wujieApp = document.querySelector('wujie-app');
+                    if (!wujieApp || !wujieApp.shadowRoot) return {{ found: false, reason: 'no shadowRoot' }};
+
+                    const sr = wujieApp.shadowRoot;
+                    const buttons = sr.querySelectorAll('button');
+                    const allTexts = Array.from(buttons).map(b => (b.textContent || '').trim().substring(0, 20));
+                    
+                    // 优先查找「发表」按钮（不是「发表视频」）
+                    var targetText = '{"保存草稿" if is_draft else "发表"}';
+                    for (const btn of buttons) {{
+                        const text = (btn.textContent || '').trim();
+                        if (text === targetText) {{
+                            const rect = btn.getBoundingClientRect();
+                            const disabled = btn.disabled || btn.className.includes('disabled');
+                            if (!disabled) {{
+                                btn.click();
+                                return {{ found: true, clicked: true, text: text, w: Math.round(rect.width), h: Math.round(rect.height) }};
+                            }} else {{
+                                return {{ found: true, clicked: false, text: text, disabled: true }};
+                            }}
+                        }}
+                    }}
+                    return {{ found: false, allBtns: allTexts }};
+                }}""")
+
+                if getattr(self, "is_draft", False):
+                    if publish_result and publish_result.get('found') and '草稿' in publish_result.get('text', ''):
+                        if publish_result.get('clicked'):
+                            tencent_logger.info(_msg("📤", f"点击草稿按钮: {publish_result['text']}"))
+                    if "post/list" in page.url or "draft" in page.url:
+                        tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
+                        break
+                else:
+                    if publish_result and publish_result.get('found'):
+                        if publish_result.get('clicked'):
+                            tencent_logger.info(_msg("📤", f"点击发表按钮: {publish_result['text']} ({publish_result.get('w')}x{publish_result.get('h')})"))
+                            await asyncio.sleep(3)
+                        elif publish_result.get('disabled'):
+                            tencent_logger.info(_msg("⏳", "发表按钮仍为禁用状态，等待中..."))
+                    else:
+                        # 调试：每 10 秒输出一次按钮列表
+                        if int(elapsed) % 10 == 0:
+                            tencent_logger.info(_msg("🔍", f"未找到发表按钮: {publish_result}"))
+
+                    if TENCENT_MANAGE_URL in page.url or "post/list" in page.url:
+                        tencent_logger.success(_msg("🥳", "视频发布成功"))
+                        break
+
+                tencent_logger.info(_msg("🏃", "视频正在发布中..."))
+                await asyncio.sleep(1)
             except Exception as exc:
                 current_url = page.url
                 if getattr(self, "is_draft", False):
@@ -667,9 +1187,34 @@ class TencentVideo(TencentBaseUploader):
             self.thumbnail_path = str(self.validate_image_file(self.thumbnail_path))
 
     async def handle_upload_error(self, page: Page) -> None:
+        """处理上传错误 - 在 Wujie shadow DOM 中删除并重新上传"""
         tencent_logger.info(_msg("😵", "视频出错了，重新上传中"))
-        await page.locator('div.media-status-content div.tag-inner:has-text("删除")').click()
-        await page.get_by_role("button", name="删除", exact=True).click()
+
+        # 尝试在 shadow DOM 中找到删除按钮
+        delete_info = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+            const sr = wujieApp.shadowRoot;
+            const allEls = sr.querySelectorAll('*');
+            for (const el of allEls) {
+                const text = (el.textContent || '').trim();
+                if (text === '删除' && el.offsetWidth > 0) {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + rect.height / 2),
+                        tag: el.tagName,
+                    };
+                }
+            }
+            return null;
+        }""")
+
+        if delete_info:
+            await page.mouse.click(delete_info['x'], delete_info['y'])
+            await asyncio.sleep(1)
+
         await self.upload_video_file(page, self.file_path)
 
     async def set_thumbnail(self, page: Page) -> None:
@@ -678,59 +1223,76 @@ class TencentVideo(TencentBaseUploader):
 
         tencent_logger.info(_msg("🖼️", "小人准备设置封面"))
 
-        cover_entry_selectors = [
-            'div.vertical-cover-wrap:has-text("个人主页卡片"):has-text("3:4")',
-            'div.vertical-cover-wrap:has-text("3:4")',
-            'div.vertical-cover-wrap:has-text("个人主页卡片")',
-        ]
-        for selector in cover_entry_selectors:
-            cover_entry = page.locator(selector).first
-            try:
-                if not await cover_entry.count():
-                    continue
-                await cover_entry.wait_for(state="visible", timeout=3000)
-                await cover_entry.click()
-                await page.wait_for_timeout(500)
-                break
-            except Exception:
-                continue
+        # 在 Wujie shadow DOM 中查找封面相关区域
+        cover_info = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return null;
 
-        cover_dialog = page.locator("div.weui-desktop-dialog").filter(has_text="编辑个人主页卡片").first
-        if not await cover_dialog.count():
-            tencent_logger.info(_msg("🧍", "当前页面没有出现封面编辑弹窗，小人先跳过自定义封面"))
+            const sr = wujieApp.shadowRoot;
+            // 查找封面相关元素
+            const allEls = sr.querySelectorAll('*');
+            for (const el of allEls) {
+                const text = (el.textContent || '').trim();
+                const cls = (el.className || '').toString();
+                if ((text.includes('封面') || cls.includes('cover')) && el.offsetWidth > 0 && el.offsetWidth < 300) {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + rect.height / 2),
+                        text: text.substring(0, 30),
+                        className: cls.substring(0, 60),
+                    };
+                }
+            }
+            return null;
+        }""")
+
+        if not cover_info:
+            tencent_logger.info(_msg("🧍", "未找到封面设置入口，跳过自定义封面"))
             return
 
-        try:
-            await cover_dialog.wait_for(state="visible", timeout=5000)
-        except Exception:
-            tencent_logger.warning(_msg("😵", "封面编辑弹窗暂时不可见，这次先跳过自定义封面"))
-            return
-
-        file_input = cover_dialog.locator('.single-cover-uploader-wrap input[type="file"]').first
-        await file_input.wait_for(state="attached", timeout=10000)
-        await file_input.set_input_files(self.thumbnail_path)
+        tencent_logger.info(_msg("🖼️", f"找到封面区域: {cover_info.get('text', '')}"))
+        # 点击封面设置入口
+        await page.mouse.click(cover_info['x'], cover_info['y'])
         await page.wait_for_timeout(1000)
 
-        crop_dialog = page.locator("div.weui-desktop-dialog").filter(has_text="裁剪封面图").first
-        if await crop_dialog.count():
-            try:
-                await crop_dialog.wait_for(state="visible", timeout=10000)
-                crop_confirm_button = crop_dialog.locator(
-                    'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确定")'
-                ).first
-                if await crop_confirm_button.count():
-                    await crop_confirm_button.wait_for(state="visible", timeout=5000)
-                    await crop_confirm_button.click()
-                    await page.wait_for_timeout(1000)
-            except Exception as exc:
-                tencent_logger.warning(_msg("😵", f"封面裁剪确认时出错，小人继续尝试保存主弹窗: {exc}"))
+        # 尝试找到文件输入来上传封面图
+        try:
+            async with page.expect_file_chooser(timeout=5000) as fc_info:
+                # 点击封面区域的文件上传入口
+                # 封面编辑弹窗中的上传按钮通常在弹窗中央
+                await page.mouse.click(cover_info['x'], cover_info['y'] + 100)
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(self.thumbnail_path)
+            tencent_logger.success(_msg("🥳", "封面图片已上传"))
+            await page.wait_for_timeout(2000)
+        except Exception as exc:
+            tencent_logger.warning(_msg("😵", f"封面上传失败: {exc}"))
 
-        confirm_button = cover_dialog.locator(
-            'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确认")'
-        ).first
-        await confirm_button.wait_for(state="visible", timeout=10000)
-        await confirm_button.click()
-        tencent_logger.success(_msg("🥳", "封面已经设置完成"))
+        # 尝试点击确认按钮
+        confirm_info = await page.evaluate("""() => {
+            const wujieApp = document.querySelector('wujie-app');
+            if (!wujieApp || !wujieApp.shadowRoot) return null;
+
+            const sr = wujieApp.shadowRoot;
+            const buttons = sr.querySelectorAll('button');
+            for (const btn of buttons) {
+                const text = (btn.textContent || '').trim();
+                if (text === '确认' || text === '确定') {
+                    const rect = btn.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.x + rect.width / 2),
+                        y: Math.round(rect.y + rect.height / 2),
+                    };
+                }
+            }
+            return null;
+        }""")
+
+        if confirm_info:
+            await page.mouse.click(confirm_info['x'], confirm_info['y'])
+            tencent_logger.success(_msg("🥳", "封面设置完成"))
+            await page.wait_for_timeout(1000)
 
     async def prepare_video_for_publish(self, page: Page) -> None:
         await self.fill_title_and_tags(page)

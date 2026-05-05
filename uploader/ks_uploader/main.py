@@ -324,6 +324,39 @@ class KSBaseUploader(BaseVideoUploader):
         await page.keyboard.press("Enter")
         await asyncio.sleep(1)
 
+    async def close_micro_support_modal(self, page: Page) -> bool:
+        """关闭快手创作者服务中心弹窗（#microSupport ant-modal）"""
+        try:
+            modal_wrap = page.locator('#microSupport .ant-modal-wrap')
+            if await modal_wrap.count() > 0 and await modal_wrap.first.is_visible():
+                kuaishou_logger.info(_msg("🔔", "检测到创作者服务弹窗(microSupport)，正在关闭..."))
+                # 优先点击确认按钮（ant-modal-confirm 弹窗通常有"我知道了"/"确认"按钮）
+                confirm_btn = page.locator('#microSupport .ant-modal-confirm-btns .ant-btn-primary')
+                if await confirm_btn.count() > 0 and await confirm_btn.first.is_visible():
+                    await confirm_btn.first.click()
+                    await asyncio.sleep(0.5)
+                # 尝试点击关闭按钮（X）
+                close_btn = page.locator('#microSupport .ant-modal-close')
+                if await close_btn.count() > 0 and await close_btn.first.is_visible():
+                    await close_btn.first.click()
+                    await asyncio.sleep(0.5)
+                # 如果弹窗还在，用 JS 强制隐藏遮罩层
+                still_visible = await modal_wrap.first.is_visible()
+                if still_visible:
+                    await page.evaluate('''() => {
+                        const wrap = document.querySelector('#microSupport .ant-modal-wrap');
+                        if (wrap) wrap.remove();
+                        const container = document.querySelector('#microSupport');
+                        if (container) container.remove();
+                    }''')
+                    kuaishou_logger.info(_msg("🔧", "已用 JS 强制移除弹窗 DOM"))
+                kuaishou_logger.success(_msg("🥳", "已关闭创作者服务弹窗"))
+                await asyncio.sleep(1)
+                return True
+        except Exception as exc:
+            kuaishou_logger.warning(_msg("⚠️", f"关闭弹窗时出错（不影响主流程）: {exc}"))
+        return False
+
     async def close_guide_overlay(self, page: Page) -> bool:
         joyride_tooltip = page.locator('div[id^="react-joyride-step"] div[role="alertdialog"]')
 
@@ -419,15 +452,18 @@ class KSVideo(KSBaseUploader):
         await self.validate_upload_args()
         kuaishou_logger.info(_msg("🥳", "上传前检查通过"))
 
+        launch_args = ["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox", "--disable-extensions", "--disable-software-rasterizer"]
         if self.local_executable_path:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 executable_path=self.local_executable_path,
+                args=launch_args,
             )
         else:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 channel="chrome",
+                args=launch_args,
             )
         context = await browser.new_context(storage_state=self.account_file)
         context = await set_init_script(context)
@@ -435,7 +471,19 @@ class KSVideo(KSBaseUploader):
         upload_success = False
         try:
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            # 导航加重试，避免超时
+            nav_ok = False
+            for attempt in range(3):
+                try:
+                    await page.goto(KUAISHOU_UPLOAD_URL, timeout=60000, wait_until="domcontentloaded")
+                    nav_ok = True
+                    break
+                except Exception as e:
+                    kuaishou_logger.warning(_msg("⚠️", f"导航重试 {attempt+1}/3: {e}"))
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+            if not nav_ok:
+                raise RuntimeError("快手上传页面加载失败（3次重试均超时）")
             kuaishou_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
             kuaishou_logger.info(_msg("🧭", "小人正在赶往快手上传主页"))
             await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN)
@@ -472,17 +520,19 @@ class KSVideo(KSBaseUploader):
                 await page.keyboard.type(f"#{tag} ")
                 await asyncio.sleep(2)
 
-            max_retries = 60
+            max_retries = 300  # 300 次 × 2 秒 = 600 秒 = 10 分钟（大视频需要更长上传时间）
             retry_count = 0
+            upload_done = False
             while retry_count < max_retries:
                 try:
                     number = await page.locator("text=上传中").count()
                     if number == 0:
-                        kuaishou_logger.success(_msg("🥳", "视频已经传完啦"))
+                        kuaishou_logger.success(_msg("🥳", f"视频已经传完啦（{retry_count * 2}秒）"))
+                        upload_done = True
                         break
 
-                    if retry_count % 5 == 0:
-                        kuaishou_logger.info(_msg("🏃", "小人正在努力上传视频"))
+                    if retry_count % 15 == 0:  # 每 30 秒打一次日志
+                        kuaishou_logger.info(_msg("🏃", f"小人正在努力上传视频（{retry_count * 2}秒）"))
 
                     if await page.locator("text=上传失败").count():
                         await self.handle_upload_error(page)
@@ -493,34 +543,136 @@ class KSVideo(KSBaseUploader):
                     await asyncio.sleep(2)
                 retry_count += 1
 
-            if retry_count == max_retries:
-                kuaishou_logger.warning(_msg("😵", "超过最大重试次数，视频上传可能未完成"))
+            if not upload_done:
+                kuaishou_logger.error(_msg("😵", f"视频上传超时（{max_retries * 2}秒），放弃发布"))
+                raise RuntimeError(f"快手视频上传超时（{max_retries * 2}秒）")
 
             await self.set_thumbnail(page)
 
             if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
                 await self.set_schedule_time(page, self.publish_date)
 
-            while True:
+            # 发布前先关闭可能弹出的创作者服务弹窗
+            await self.close_micro_support_modal(page)
+
+            # === 第一步：点击发布按钮（只点一次） ===
+            # 快手的发布按钮不是 <button>，而是 <div>，位于页面底部
+            # DOM: div[class*='edit-section-btns'] > div[class*='button-primary'] > "发布"
+            # 注意：按钮可能在视口外（y≈1189），需要先滚动
+            publish_clicked = False
+            publish_selectors = [
+                # 最精确：编辑区域底部的发布按钮容器内找"发布"
+                "div[class*='edit-section-btns'] div[class*='button-primary']",
+                # fallback：任何 class 含 button-primary 且文本为"发布"的 div
+                "div[class*='button-primary']:has-text('发布')",
+                # fallback2：get_by_role
+                page.get_by_role("button", name="发布", exact=True),
+            ]
+            for sel in publish_selectors:
                 try:
-                    publish_button = page.get_by_text("发布", exact=True)
-                    if await publish_button.count() > 0:
-                        await publish_button.click()
+                    if isinstance(sel, str):
+                        locator = page.locator(sel).first
+                    else:
+                        locator = sel
+                    if await locator.count() > 0:
+                        # 滚动到可见
+                        await locator.scroll_into_view_if_needed(timeout=5000)
+                        await asyncio.sleep(0.5)
+                        await locator.click()
+                        publish_clicked = True
+                        kuaishou_logger.info(_msg("📤", f"已点击发布按钮（选择器: {sel if isinstance(sel, str) else 'role=button'}）"))
+                        break
+                except Exception as e:
+                    kuaishou_logger.debug(_msg("🔍", f"选择器 {sel if isinstance(sel, str) else 'role'} 未命中: {e}"))
+                    continue
 
-                    await asyncio.sleep(1)
-                    confirm_button = page.get_by_text("确认发布")
-                    if await confirm_button.count() > 0:
-                        await confirm_button.click()
+            if not publish_clicked:
+                kuaishou_logger.warning(_msg("⚠️", "所有发布按钮选择器均未命中"))
 
-                    await page.wait_for_url(KUAISHOU_MANAGE_URL_PATTERN, timeout=5000)
-                    kuaishou_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
+            await asyncio.sleep(1)
+
+            # 检查是否弹出确认发布按钮
+            confirm_selectors = [
+                "div[class*='button-primary']:has-text('确认发布')",
+                page.get_by_role("button", name="确认发布", exact=True),
+                page.locator("text=确认发布"),
+            ]
+            for sel in confirm_selectors:
+                if isinstance(sel, str):
+                    locator = page.locator(sel).first
+                else:
+                    locator = sel
+                if await locator.count() > 0:
+                    try:
+                        await locator.click()
+                        kuaishou_logger.info(_msg("📤", "已点击确认发布"))
+                    except Exception:
+                        pass
                     break
-                except Exception as exc:
-                    kuaishou_logger.info(_msg("🏃", f"小人正在冲刺发布视频: {exc}"))
-                    if self.debug:
-                        await page.screenshot(full_page=True)
-                    await asyncio.sleep(1)
 
+            await asyncio.sleep(2)
+
+            # === 第二步：多信号检测发布结果 ===
+            if not publish_clicked:
+                raise RuntimeError("未找到发布按钮，无法发布")
+
+            max_wait = 60  # 最多等待 120 秒
+            publish_success = False
+            for check_i in range(max_wait):
+                # 定期关闭弹窗
+                if check_i % 5 == 0:
+                    await self.close_micro_support_modal(page)
+
+                try:
+                    current_url = page.url
+                    # 信号1：URL 跳转到管理页
+                    if "article/manage/video" in current_url:
+                        kuaishou_logger.success(_msg("🥳", f"视频发布成功（URL跳转检测）: {current_url}"))
+                        publish_success = True
+                        break
+
+                    # 信号2：页面出现"发布成功"相关提示
+                    success_texts = ["发布成功", "投稿成功", "已发布"]
+                    for txt in success_texts:
+                        if await page.locator(f"text={txt}").count() > 0:
+                            kuaishou_logger.success(_msg("🥳", f"视频发布成功（页面提示检测）: {txt}"))
+                            publish_success = True
+                            break
+                    if publish_success:
+                        break
+
+                    # 信号3：发布按钮消失（发布中→已完成）
+                    if await page.locator("div[class*='edit-section-btns']").count() == 0 and check_i > 3:
+                        kuaishou_logger.success(_msg("🥳", "视频发布成功（发布按钮消失）"))
+                        publish_success = True
+                        break
+
+                    # 反爬拦截检测 → 立即终止
+                    page_content = await page.content()
+                    anti_bot_markers = ["操作频繁", "账号异常", "验证码", "人机验证", "captcha"]
+                    for marker in anti_bot_markers:
+                        if marker in page_content:
+                            kuaishou_logger.error(_msg("🚫", f"检测到反爬拦截: {marker}，终止发布"))
+                            raise RuntimeError(f"快手发布被反爬拦截: {marker}")
+
+                    # 错误检测
+                    error_markers = ["发布失败", "上传失败", "审核不通过", "违规"]
+                    for marker in error_markers:
+                        if await page.locator(f"text={marker}").count() > 0:
+                            kuaishou_logger.error(_msg("❌", f"视频发布失败: {marker}"))
+                            raise RuntimeError(f"快手发布失败: {marker}")
+
+                except RuntimeError:
+                    raise
+                except Exception as exc:
+                    kuaishou_logger.warning(_msg("😵", f"检测发布结果时出错: {exc}"))
+
+                await asyncio.sleep(2)
+
+            if not publish_success:
+                kuaishou_logger.warning(_msg("⚠️", f"发布结果检测超时（{max_wait * 2}秒），但视频可能已发布成功"))
+
+            # 无论检测结果如何，只要点了发布按钮就视为成功（避免重复上传已发布视频）
             upload_success = True
         finally:
             if upload_success:
@@ -640,40 +792,59 @@ class KSNote(KSBaseUploader):
         if self.publish_strategy == KUAISHOU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time(page, self.publish_date)
 
-        while True:
+        publish_retry_count = 0
+        max_publish_attempts = 120
+        while publish_retry_count < max_publish_attempts:
+            publish_retry_count += 1
             try:
-                publish_button = page.get_by_text("发布", exact=True)
+                publish_button = page.get_by_role("button", name="发布", exact=True)
                 if await publish_button.count() > 0:
                     await publish_button.click()
+                    kuaishou_logger.info(_msg("📤", f"已点击发布按钮（尝试 {publish_retry_count}）"))
 
                 await asyncio.sleep(1)
-                confirm_button = page.get_by_text("确认发布")
+                confirm_button = page.get_by_role("button", name="确认发布", exact=True)
                 if await confirm_button.count() > 0:
                     await confirm_button.click()
+                    kuaishou_logger.info(_msg("📤", "已点击确认发布"))
 
                 await page.wait_for_url(KUAISHOU_MANAGE_URL_PATTERN, timeout=5000)
                 kuaishou_logger.success(_msg("🥳", "图文发布成功，小人开心收工"))
                 break
             except Exception as exc:
-                kuaishou_logger.info(_msg("🏃", f"小人正在冲刺发布图文: {exc}"))
+                anti_bot_markers = ["操作频繁", "账号异常", "验证", "captcha", "人机", "打码"]
+                if any(m in str(exc) for m in anti_bot_markers):
+                    kuaishou_logger.error(_msg("🚫", f"检测到反爬拦截: {exc}，终止发布"))
+                    raise
+                kuaishou_logger.info(_msg("🏃", f"小人正在冲刺发布图文: {exc}（{publish_retry_count}/{max_publish_attempts}）"))
                 if self.debug:
-                    await page.screenshot(full_page=True)
-                await asyncio.sleep(1)
+                    try:
+                        await page.screenshot(full_page=True, path=f"debug_ks_note_{publish_retry_count}.png")
+                    except Exception:
+                        pass
+                await asyncio.sleep(2)
+
+        if publish_retry_count >= max_publish_attempts:
+            kuaishou_logger.error(_msg("😵", f"图文发布按钮循环超时（{max_publish_attempts} 次）"))
+            raise RuntimeError(f"快手图文发布按钮循环超时（{max_publish_attempts} 次尝试均未成功）")
 
     async def upload(self, playwright: Playwright) -> None:
         kuaishou_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         kuaishou_logger.info(_msg("🥳", "图文上传前检查通过"))
 
+        launch_args = ["--disable-gpu", "--disable-dev-shm-usage", "--no-sandbox", "--disable-extensions", "--disable-software-rasterizer"]
         if self.local_executable_path:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 executable_path=self.local_executable_path,
+                args=launch_args,
             )
         else:
             browser = await playwright.chromium.launch(
                 headless=self.headless,
                 channel="chrome",
+                args=launch_args,
             )
         context = await browser.new_context(storage_state=self.account_file)
         context = await set_init_script(context)
@@ -681,7 +852,18 @@ class KSNote(KSBaseUploader):
         upload_success = False
         try:
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            nav_ok = False
+            for attempt in range(3):
+                try:
+                    await page.goto(KUAISHOU_UPLOAD_URL, timeout=60000, wait_until="domcontentloaded")
+                    nav_ok = True
+                    break
+                except Exception as e:
+                    kuaishou_logger.warning(_msg("⚠️", f"导航重试 {attempt+1}/3: {e}"))
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+            if not nav_ok:
+                raise RuntimeError("快手图文发布页加载失败（3次重试均超时）")
             kuaishou_logger.info(_msg("🧭", "小人正在赶往快手图文发布页"))
             await page.wait_for_url(KUAISHOU_UPLOAD_URL_PATTERN)
 

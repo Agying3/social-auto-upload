@@ -3,12 +3,17 @@ from datetime import timedelta
 from datetime import datetime
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import DATA_DIR
 
 
 def get_absolute_path(relative_path: str, base_dir: str = None) -> str:
     # Convert the relative path to an absolute path
-    absolute_path = Path(BASE_DIR) / base_dir / relative_path
+    # 使用 DATA_DIR（冻结模式下为 %APPDATA%/TujueAutoSend，开发模式下为项目目录）
+    # cookie 等可写数据应存放在 DATA_DIR/cookies/ 下
+    if base_dir:
+        absolute_path = Path(DATA_DIR) / "cookies" / base_dir / relative_path
+    else:
+        absolute_path = Path(DATA_DIR) / "cookies" / relative_path
     return str(absolute_path)
 
 

@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import DATA_DIR
 
-Path(BASE_DIR / "cookies" / "tencent_uploader").mkdir(exist_ok=True)
+Path(DATA_DIR / "cookies" / "tencent_uploader").mkdir(exist_ok=True)
 
 from uploader.tencent_uploader.main import TENCENT_PUBLISH_STRATEGY_IMMEDIATE
 from uploader.tencent_uploader.main import TENCENT_PUBLISH_STRATEGY_SCHEDULED

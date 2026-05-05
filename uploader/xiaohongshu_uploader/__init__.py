@@ -1,5 +1,5 @@
 from pathlib import Path
 
-from conf import BASE_DIR
+from conf import DATA_DIR
 
-Path(BASE_DIR / "cookies" / "xiaohongshu_uploader").mkdir(exist_ok=True)
+Path(DATA_DIR / "cookies" / "xiaohongshu_uploader").mkdir(exist_ok=True)

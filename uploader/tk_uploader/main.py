@@ -15,27 +15,30 @@ from conf import LOCAL_CHROME_HEADLESS
 async def cookie_auth(account_file):
     async with async_playwright() as playwright:
         browser = await playwright.firefox.launch(headless=LOCAL_CHROME_HEADLESS)
-        context = await browser.new_context(storage_state=account_file)
-        context = await set_init_script(context)
-        # 创建一个新的页面
-        page = await context.new_page()
-        # 访问指定的 URL
-        await page.goto("https://www.tiktok.com/tiktokstudio/upload?lang=en")
-        await page.wait_for_load_state('networkidle')
         try:
-            # 选择所有的 select 元素
-            select_elements = await page.query_selector_all('select')
-            for element in select_elements:
-                class_name = await element.get_attribute('class')
-                # 使用正则表达式匹配特定模式的 class 名称
-                if re.match(r'tiktok-.*-SelectFormContainer.*', class_name):
-                    tiktok_logger.error("[+] cookie expired")
-                    return False
-            tiktok_logger.success("[+] cookie valid")
-            return True
-        except:
-            tiktok_logger.success("[+] cookie valid")
-            return True
+            context = await browser.new_context(storage_state=account_file)
+            context = await set_init_script(context)
+            # 创建一个新的页面
+            page = await context.new_page()
+            # 访问指定的 URL
+            await page.goto("https://www.tiktok.com/tiktokstudio/upload?lang=en")
+            await page.wait_for_load_state('networkidle')
+            try:
+                # 选择所有的 select 元素
+                select_elements = await page.query_selector_all('select')
+                for element in select_elements:
+                    class_name = await element.get_attribute('class')
+                    # 使用正则表达式匹配特定模式的 class 名称
+                    if re.match(r'tiktok-.*-SelectFormContainer.*', class_name):
+                        tiktok_logger.error("[+] cookie expired")
+                        return False
+                tiktok_logger.success("[+] cookie valid")
+                return True
+            except:
+                tiktok_logger.success("[+] cookie valid")
+                return True
+        finally:
+            await browser.close()
 
 
 async def tiktok_setup(account_file, handle=False):
@@ -58,15 +61,18 @@ async def get_tiktok_cookie(account_file):
         }
         # Make sure to run headed.
         browser = await playwright.firefox.launch(**options)
-        # Setup context however you like.
-        context = await browser.new_context()  # Pass any options
-        context = await set_init_script(context)
-        # Pause the page, and start recording manually.
-        page = await context.new_page()
-        await page.goto("https://www.tiktok.com/login?lang=en")
-        await page.pause()
-        # 点击调试器的继续，保存cookie
-        await context.storage_state(path=account_file)
+        try:
+            # Setup context however you like.
+            context = await browser.new_context()  # Pass any options
+            context = await set_init_script(context)
+            # Pause the page, and start recording manually.
+            page = await context.new_page()
+            await page.goto("https://www.tiktok.com/login?lang=en")
+            await page.pause()
+            # 点击调试器的继续，保存cookie
+            await context.storage_state(path=account_file)
+        finally:
+            await browser.close()
 
 
 class TiktokVideo(object):
@@ -143,46 +149,56 @@ class TiktokVideo(object):
 
     async def upload(self, playwright: Playwright) -> None:
         browser = await playwright.firefox.launch(headless=self.headless)
-        context = await browser.new_context(storage_state=f"{self.account_file}")
-        context = await set_init_script(context)
-        page = await context.new_page()
-
-        await page.goto("https://www.tiktok.com/creator-center/upload")
-        tiktok_logger.info(f'[+]Uploading-------{self.title}.mp4')
-
-        await page.wait_for_url("https://www.tiktok.com/tiktokstudio/upload", timeout=10000)
-
+        context = None
         try:
-            await page.wait_for_selector('iframe[data-tt="Upload_index_iframe"], div.upload-container', timeout=10000)
-            tiktok_logger.info("Either iframe or div appeared.")
-        except Exception as e:
-            tiktok_logger.error("Neither iframe nor div appeared within the timeout.")
+            context = await browser.new_context(storage_state=f"{self.account_file}")
+            context = await set_init_script(context)
+            page = await context.new_page()
 
-        await self.choose_base_locator(page)
+            await page.goto("https://www.tiktok.com/creator-center/upload")
+            tiktok_logger.info(f'[+]Uploading-------{self.title}.mp4')
 
-        upload_button = self.locator_base.locator(
-            'button:has-text("Select video"):visible')
-        await upload_button.wait_for(state='visible')  # 确保按钮可见
+            await page.wait_for_url("https://www.tiktok.com/tiktokstudio/upload", timeout=10000)
 
-        async with page.expect_file_chooser() as fc_info:
-            await upload_button.click()
-        file_chooser = await fc_info.value
-        await file_chooser.set_files(self.file_path)
+            try:
+                await page.wait_for_selector('iframe[data-tt="Upload_index_iframe"], div.upload-container', timeout=10000)
+                tiktok_logger.info("Either iframe or div appeared.")
+            except Exception as e:
+                tiktok_logger.error("Neither iframe nor div appeared within the timeout.")
 
-        await self.add_title_tags(page)
-        # detact upload status
-        await self.detect_upload_status(page)
-        if self.publish_date != 0:
-            await self.set_schedule_time(page, self.publish_date)
+            await self.choose_base_locator(page)
 
-        await self.click_publish(page)
+            upload_button = self.locator_base.locator(
+                'button:has-text("Select video"):visible')
+            await upload_button.wait_for(state='visible')  # 确保按钮可见
 
-        await context.storage_state(path=f"{self.account_file}")  # save cookie
-        tiktok_logger.info('  [-] update cookie！')
-        await asyncio.sleep(2)  # close delay for look the video status
-        # close all
-        await context.close()
-        await browser.close()
+            async with page.expect_file_chooser() as fc_info:
+                await upload_button.click()
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(self.file_path)
+
+            await self.add_title_tags(page)
+            # detact upload status
+            await self.detect_upload_status(page)
+            if self.publish_date != 0:
+                await self.set_schedule_time(page, self.publish_date)
+
+            await self.click_publish(page)
+
+            await context.storage_state(path=f"{self.account_file}")  # save cookie
+            tiktok_logger.info('  [-] update cookie！')
+            await asyncio.sleep(2)  # close delay for look the video status
+        finally:
+            # 确保浏览器被关闭（无论成功还是失败）
+            if context:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     async def add_title_tags(self, page):
 

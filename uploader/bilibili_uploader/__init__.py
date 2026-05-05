@@ -1,1 +1,5 @@
-"""Bilibili uploader package."""
+from pathlib import Path
+
+from conf import DATA_DIR
+
+Path(DATA_DIR / "cookies" / "bilibili_uploader").mkdir(exist_ok=True)
