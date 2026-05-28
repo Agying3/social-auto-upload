@@ -29,21 +29,59 @@ def build():
     background: rgba(255,255,255,0.12); border-radius: 3px;
 }}
 ::-webkit-scrollbar-thumb:hover {{ background: rgba(255,255,255,0.2); }}
+
+/* ====== 标题栏窗口按钮（ai0 PySide6 QSS 风格）====== */
+.win-btn {{
+    -webkit-app-region: no-drag;
+    width: 28px; height: 28px; border-radius: 7px;
+    background: transparent; border: 0.5px solid transparent;
+    color: rgba(255,255,255,0.30); font-size: 14px; font-weight: 400;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s;
+    margin-left: 4px; padding: 0; line-height: 1;
+}}
+.win-btn:hover {{
+    background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.70);
+    border-color: rgba(255,255,255,0.06);
+}}
+.win-btn:active {{ background: rgba(255,255,255,0.04); }}
+.win-close:hover {{
+    background: rgba(237,69,96,0.30); color: #ffb3bb;
+    border-color: rgba(237,69,96,0.20);
+}}
+
+html {{
+    width: 100vw; height: 100vh; margin: 0; padding: 0;
+    overflow: hidden;
+    background: #14161c;
+}}
 body {{
     font-family: "DengXian","Segoe UI","Microsoft YaHei",sans-serif;
-    color: #fff; min-height: 100vh; overflow-x: hidden;
-    background: #000;
+    color: #fff; width: 100vw; min-height: 100vh; margin: 0; padding: 0;
+    overflow: hidden;
+    background: #14161c;
+    -webkit-app-region: no-drag;
 }}
+
+/* ====== 内容滚动层 ====== */
+.scroll-area {{
+    position: absolute; inset: 0; z-index: 1;
+    overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth;
+    padding-top: 50px;
+}}
+.scroll-area::-webkit-scrollbar {{ width: 3px; }}
+.scroll-area::-webkit-scrollbar-thumb {{ background: rgba(255,255,255,0.1); border-radius: 3px; }}
+.scroll-area::-webkit-scrollbar-track {{ background: transparent; }}
 
 /* ========== 壁纸轮播层 ========== */
 #wallpaper-bg {{
-    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-    z-index: 0;
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 0; overflow: hidden;
 }}
 #wallpaper-bg .wp {{
     position: absolute; top: 0; left: 0; width: 100%; height: 100%;
     background-size: cover; background-position: center;
-    opacity: 0; transition: opacity 2s ease;
+    opacity: 0; transition: opacity 1.2s ease;
 }}
 #wallpaper-bg .wp.active {{ opacity: 1; }}
 /* 暗角遮罩 */
@@ -69,8 +107,10 @@ body {{
 
 /* ========== 主容器 ========== */
 .app-container {{
-    position: relative; z-index: 5; max-width: 1100px; margin: 0 auto;
-    padding: 20px; min-height: 100vh;
+    position: absolute; inset: 0; z-index: 1;
+    overflow-y: auto; overflow-x: hidden; scroll-behavior: smooth;
+    padding: 52px 20px 40px 20px;
+    -webkit-app-region: no-drag;
 }}
 
 /* ========== 页面区域 ========== */
@@ -740,6 +780,7 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 .badge-in  {{ background:rgba(34,197,94,0.2); color:#4ade80; border:1px solid rgba(34,197,94,0.3); }}
 .badge-out {{ background:rgba(239,68,68,0.15); color:#f87171; border:1px solid rgba(239,68,68,0.25); }}
 .badge-na  {{ background:rgba(156,163,175,0.15); color:#9ca3af; border:1px solid rgba(156,163,175,0.2); }}
+.badge-expired {{ background:rgba(251,191,36,0.2); color:#fbbf24; border:1px solid rgba(251,191,36,0.3); }}
 
 /* 账号列表项 */
 .acct-list {{ margin-top:4px; }}
@@ -1100,18 +1141,17 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 
 /* E4: 鼠标跟随光晕 - 更大更亮+多色 */
 #cursor-glow {{
-    position: fixed; width: 500px; height: 500px;
+    position: fixed; width: 300px; height: 300px;
     border-radius: 50%; pointer-events: none; z-index: 3;
     background: radial-gradient(circle,
-        rgba(99,102,241,0.14) 0%,
-        rgba(139,92,246,0.08) 25%,
-        rgba(236,72,153,0.04) 45%,
+        rgba(99,102,241,0.10) 0%,
+        rgba(139,92,246,0.05) 25%,
+        rgba(236,72,153,0.03) 45%,
         transparent 70%
     );
     transform: translate(-50%, -50%);
-    transition: left 0.08s ease-out, top 0.08s ease-out;
-    will-change: left, top;
-    mix-blend-mode: screen;
+    /* 移除 will-change 和 mix-blend-mode —— WebView2 中这两个是最大的 GPU 消耗源 */
+    /* JS 中通过 requestAnimationFrame 直接设置 transform 定位 */
 }}
 
 /* E5: 打字机光标闪烁 - 更粗更亮 */
@@ -1139,6 +1179,7 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
     position: relative; overflow: hidden;
     border-color: rgba(99,102,241,0.2);
     box-shadow: 0 0 12px rgba(99,102,241,0.08);
+    contain: layout style;  /* 限制重绘范围，提升渲染性能 */
 }}
 .progress-item.pi-uploading::after {{
     content:""; position:absolute; inset:0;
@@ -1237,7 +1278,6 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 .sun-orb {{
     position: absolute; width: 28px; height: 28px; border-radius: 50%;
     cursor: grab; z-index: 3; transform: translate(-50%, -50%);
-    will-change: left, top, opacity;
     transition: opacity 0.4s ease;
 }}
 .sun-orb.falling {{ opacity: 0; }}
@@ -1246,18 +1286,15 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 .sun-orb:active, .sun-orb.dragging {{ cursor: grabbing; }}
 .sun-body {{
     width: 100%; height: 100%; border-radius: 50%; position: relative; z-index: 2;
-    will-change: background, box-shadow;
 }}
 .sun-shadow {{
     position: absolute; width: 18px; height: 4px; border-radius: 50%;
     bottom: -11px; left: 50%; transform: translateX(-50%); z-index: 1;
     background: rgba(0,0,0,0.25); filter: blur(3px);
-    will-change: transform, opacity, background;
 }}
 /* 云朵（跟随太阳，覆盖在太阳上） */
 .sun-cloud {{
     position: absolute; border-radius: 12px; opacity: 0; z-index: 4; pointer-events: none;
-    will-change: opacity, transform, left, top;
 }}
 
 /* ========== 小太阳爆炸特效 ========== */
@@ -1538,6 +1575,24 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 </style>
 <body>
 
+<!-- ====== 标题栏（纯透明，仅 text+按钮，拖拽区）====== -->
+<div class="title-bar" style="
+    position:fixed; top:0; left:0; right:0; z-index:9999;
+    display:flex; align-items:center; padding:0 14px 0 20px; height:48px;
+    -webkit-app-region:drag; box-sizing:border-box;
+">
+    <!-- 左侧：标题（可拖拽） -->
+    <span style="font-size:13px;font-weight:600;color:rgba(255,255,255,0.45);-webkit-app-region:drag;user-select:none;">
+        Tujue AutoSend
+    </span>
+    <!-- 中间占位 -->
+    <div style="flex:1;-webkit-app-region:drag;"></div>
+    <!-- 右侧：窗口控制按钮（ai0 风格） -->
+    <button class="win-btn" onclick="window.pywebview.api.minimize()" title="\\u6700\\u5C0F\\u5316">─</button>
+    <button class="win-btn" onclick="void(0)" title="\\u6700\\u5927\\u5316">□</button>
+    <button class="win-btn win-close" onclick="window.pywebview.api.close()" title="\\u5173\\u95ED">✕</button>
+</div>
+
 <!-- ====== 鼠标跟随光晕 E4 ====== -->
 <div id="cursor-glow"></div>
 
@@ -1632,7 +1687,7 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 
     <!-- 返回首页按钮 -->
     <div class="subpage-header">
-        <div class="back-home-btn" onclick="goHome()">◀ 返回首页</div>
+        <div class="back-home-btn" id="backHomeBtnLogin" onclick="smartGoHome()">◀ 返回首页</div>
     </div>
 
     <!-- 视频选择 -->
@@ -1736,17 +1791,23 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 
     <!-- 返回首页按钮 -->
     <div class="subpage-header">
-        <div class="back-home-btn disabled" onclick="goHomeDisabled(this)">◀ 返回首页</div>
+        <div class="back-home-btn" id="backHomeBtnLogin" onclick="smartGoHome()">◀ 返回首页</div>
     </div>
 
-    <!-- 页面标题 + 提示 -->
+    <!-- 页面标题 + 操作按钮 -->
     <div class="card">
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div class="card-title"><span class="icon">🔑</span> 登录管理</div>
-            <button id="btnRefreshLogin" onclick="refreshLoginPage()" style="display:flex;align-items:center;gap:5px;padding:7px 14px;border-radius:10px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);color:rgba(255,255,255,0.7);font-size:12px;cursor:pointer;transition:all 0.2s;">
-                <svg id="refreshIcon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
-                刷新状态
-            </button>
+            <div style="display:flex;gap:8px;">
+                <button id="btnCheckCookies" onclick="checkAllCookies()" style="display:flex;align-items:center;gap:5px;padding:7px 14px;border-radius:10px;background:rgba(251,191,36,0.15);border:1px solid rgba(251,191,36,0.25);color:#fbbf24;font-size:12px;cursor:pointer;transition:all 0.2s;"
+                    title="检测所有已登录平台的 Cookie 是否有效">
+                    🔍 检测登录状态
+                </button>
+                <button id="btnRefreshLogin" onclick="refreshLoginPage()" style="display:flex;align-items:center;gap:5px;padding:7px 14px;border-radius:10px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);color:rgba(255,255,255,0.7);font-size:12px;cursor:pointer;transition:all 0.2s;">
+                    <svg id="refreshIcon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+                    刷新状态
+                </button>
+            </div>
         </div>
 
         <!-- 小太阳弧形动画 -->
@@ -1763,7 +1824,8 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
         </div>
 
         <p style="font-size:13px;color:rgba(255,255,255,0.4);margin-bottom:18px;">
-            管理各平台账号，扫码登录或退出已登录的账号
+            管理各平台账号，扫码登录或退出已登录的账号<br>
+            <span style="font-size:11px;color:rgba(255,255,255,0.25);">💡 双击上方太阳 → 退出 / 切换账号</span>
         </p>
 
         <!-- 全局提示条 -->
@@ -1819,7 +1881,7 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 
     <!-- 返回首页按钮 -->
     <div class="subpage-header">
-        <div class="back-home-btn" onclick="goHome()">◀ 返回首页</div>
+        <div class="back-home-btn" id="backHomeBtnLogin" onclick="smartGoHome()">◀ 返回首页</div>
     </div>
 
     <!-- 筛选工具栏 -->
@@ -1886,7 +1948,7 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 
     <!-- 返回首页按钮 -->
     <div class="subpage-header">
-        <div class="back-home-btn" onclick="goHome()">◀ 返回首页</div>
+        <div class="back-home-btn" id="backHomeBtnLogin" onclick="smartGoHome()">◀ 返回首页</div>
     </div>
 
     <!-- 基本设置 -->
@@ -2109,7 +2171,7 @@ function startWPCarousel() {{
         currentWP = (currentWP + 1) % count;
         wps[currentWP].classList.add("active");
         if (dots[currentWP]) dots[currentWP].classList.add("active");
-    }}, 6000);
+    }}, 20000);  // 20 秒切换一次（降低 GPU 合成负担）
 }}
 
 function switchWP(idx) {{
@@ -2637,8 +2699,8 @@ async function doRetryHistory(recordId, evt) {{
         }});
         updateStatusBar();
 
-        // 切到发布页并提示用户
-        goToPage('page-publish');
+        // 切到发布页并提示用户（不用 goToPage，避免清除刚设置的视频状态）
+        goToPageWithoutClear('page-publish');
 
         showToast('\u2705 \u5df2\u586b\u5145\u91cd\u8bd5\u53c2\u6570\uff0c\u70b9\u51fb\u53d1\u5e03\u6309\u94ae\u5373\u53ef', 'success');
 
@@ -2675,24 +2737,62 @@ async function doDeleteHistory(recordId, evt) {{
 // 导航首页 → 子页面 跳转
 // ============================================================
 function goToPage(pageId) {{
-    // 隐藏首页，显示目标子页面
+    // 隐藏首页及所有子页面
+    document.getElementById('page-home').classList.remove('active');
+    document.querySelectorAll(".page-section").forEach(function(p) {{
+        p.classList.remove("active");
+    }});
+    // 清除首页卡片 3D 残留
     var home = document.getElementById('page-home');
-    home.classList.remove('active');
-
-    /* 点击离开时立即清除所有卡片的内联 transform，避免残留 3D 状态触发多余重绘 */
     home.querySelectorAll(".nav-card").forEach(function(c) {{ c.style.transform = ""; }});
 
     var target = document.getElementById(pageId);
     if (target) target.classList.add('active');
-
-    // 触发页面初始化回调
+    // 离开登录页时停止自动检测
+    if (pageId !== 'page-login') stopAutoCookieCheck();
     triggerPageCallback(pageId);
+}}
+
+/** 跳转页面但不清理发布状态（供重试历史等内部流程使用） */
+function goToPageWithoutClear(pageId) {{
+    document.getElementById('page-home').classList.remove('active');
+    document.querySelectorAll(".page-section").forEach(function(p) {{
+        p.classList.remove("active");
+    }});
+    var home = document.getElementById('page-home');
+    home.querySelectorAll(".nav-card").forEach(function(c) {{ c.style.transform = ""; }});
+    var target = document.getElementById(pageId);
+    if (target) target.classList.add('active');
+    if (pageId !== 'page-login') stopAutoCookieCheck();
+    triggerPageCallback(pageId);
+}}
+
+/** 清理发布页面的视频选择状态（保留标题/描述文本） */
+function clearPublishState() {{
+    selectedVideo = "";
+    var zone = document.getElementById("uploadZone");
+    if (zone) zone.classList.remove("has-file");
+    var hint = document.getElementById("uploadHint");
+    if (hint) hint.style.display = "";
+    var preview = document.getElementById("videoPreview");
+    if (preview) {{
+        if (preview.src && preview.src.startsWith('blob:')) URL.revokeObjectURL(preview.src);
+        preview.src = "";
+        preview.style.display = "none";
+    }}
+    var fileInfo = document.getElementById("fileInfo");
+    if (fileInfo) fileInfo.style.display = "none";
+    var input = document.getElementById("videoInput");
+    if (input) input.value = "";
 }}
 
 // ============================================================
 // 返回首页（从任意子页）
 // ============================================================
 function goHome() {{
+    // 清理发布页状态
+    clearPublishState();
+    stopAutoCookieCheck();
     // 隐藏所有子页面和首页
     document.querySelectorAll(".page-section").forEach(function(p) {{
         p.classList.remove("active");
@@ -2702,6 +2802,15 @@ function goHome() {{
     }});
     // 显示首页
     document.getElementById('page-home').classList.add('active');
+}}
+
+/** 智能返回首页：有登录进行中时阻止跳转 */
+function smartGoHome() {{
+    if (curLoginSid) {{
+        goHomeDisabled(document.getElementById('backHomeBtnLogin'));
+        return;
+    }}
+    goHome();
 }}
 
 /* 失效的返回首页按钮（登录管理页专用）：只给反馈，不跳转 */
@@ -3012,7 +3121,7 @@ let curLoginPlat = null;      // 当前登录的平台 ID
 let loginPollTimer = null;    // 轮询定时器
 
 /** 切到登录页时触发 */
-function onShowLoginPage() {{ renderPlatformCards(); initSunArc(); }}
+function onShowLoginPage() {{ renderPlatformCards(); initSunArc(); startAutoCookieCheck(); }}
 
 // ============================================================
 // 小太阳弧形动画（顺时针高弧线 + 日出日落 + 云朵 + 可拖动）
@@ -3777,9 +3886,106 @@ async function renderPlatformCards() {{
 
         container.innerHTML = html;
 
+        // 异步检测已登录平台的 cookie 是否有效（不阻塞 UI）
+        json.data.filter(function(p) {{ return p.supported && p.logged_in; }}).forEach(function(p) {{
+            setTimeout(function() {{ checkPlatformCookie(p.id); }}, 500);
+        }});
+
     }} catch(e) {{
         container.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:30px;color:#f87171;">\\u274C \\u52A0\\u8F7D\\u5931\\u8D25: ' + e.message + '</div>';
     }}
+}}
+
+/** 异步检测平台 cookie 是否有效，过期则更新 UI */
+async function checkPlatformCookie(platform) {{
+    try {{
+        var r = await fetch('/api/check-cookie/' + platform);
+        var j = await r.json();
+        if (j.code === 0 && j.data && !j.data.valid) {{
+            markPlatformExpired(platform, j.data.reason || 'Cookie\\u5DF2\\u8FC7\\u671F');
+        }}
+    }} catch(e) {{
+        // 检测失败静默处理，不改变登录状态
+        console.warn('[cookie-check] \\u68C0\\u6D4B\\u5931\\u8D25: ' + platform, e);
+    }}
+}}
+
+/** 将指定平台标记为过期状态 */
+function markPlatformExpired(platform, reason) {{
+    var card = document.querySelector('.plat-card[data-plat="' + platform + '"]');
+    if (!card) return;
+    // 更新徽章
+    var badge = card.querySelector('.pch-badge');
+    if (badge) {{
+        badge.textContent = '\\u8FC7\\u671F';
+        badge.className = 'pch-badge badge-expired';
+    }}
+    // 添加过期提示（避免重复添加）
+    var actions = card.querySelector('.pca-actions');
+    if (actions && !actions.querySelector('.cookie-expired-warn')) {{
+        var warn = document.createElement('div');
+        warn.className = 'cookie-expired-warn';
+        warn.textContent = '\\u26A0\\uFE0F ' + reason;
+        warn.style.cssText = 'color:#fbbf24;font-size:11px;margin-bottom:6px;';
+        actions.insertBefore(warn, actions.firstChild);
+        // 弹出全局通知
+        showToast('\\u26A0\\uFE0F ' + (platformData.find(function(p){{return p.id===platform}})||{{name:platform}}).name + '\\u767B\\u5F55\\u5DF2\\u8FC7\\u671F\\uFF0C\\u8BF7\\u91CD\\u65B0\\u767B\\u5F55', 'warn');
+    }}
+}}
+
+/** 手动检测所有已登录平台的 Cookie 是否有效 */
+var _autoCheckTimer = null;
+
+function checkAllCookies() {{
+    var btn = document.getElementById('btnCheckCookies');
+    if (btn) {{ btn.textContent = '\\u23F3 \\u68C0\\u6D4B\\u4E2D...'; btn.disabled = true; }}
+    // 逐个检测（避免并发浏览器实例冲突）
+    var loggedIn = platformData.filter(function(p) {{ return p.supported && p.logged_in; }});
+    var i = 0;
+    function next() {{
+        if (i >= loggedIn.length) {{
+            if (btn) {{ btn.textContent = '\\u2705 \\u68C0\\u6D4B\\u5B8C\\u6210'; btn.disabled = false;
+                setTimeout(function(){{ btn.textContent = '\\uD83D\\uDD0D \\u68C0\\u6D4B\\u767B\\u5F55\\u72B6\\u6001'; }}, 2000); }}
+            return;
+        }}
+        checkPlatformCookie(loggedIn[i].id).then(function() {{
+            i++;
+            setTimeout(next, 600);
+        }});
+    }}
+    next();
+    if (loggedIn.length === 0 && btn) {{
+        btn.textContent = '\\uD83D\\uDD0D \\u68C0\\u6D4B\\u767B\\u5F55\\u72B6\\u6001'; btn.disabled = false;
+        showToast('\\u6682\\u65E0\\u5DF2\\u767B\\u5F55\\u5E73\\u53F0', 'info');
+    }}
+}}
+
+/** 启动 30 秒自动检测定时器 */
+function startAutoCookieCheck() {{
+    stopAutoCookieCheck();
+    _autoCheckTimer = setInterval(function() {{
+        // 仅在登录管理页可见时执行
+        var loginPage = document.getElementById('page-login');
+        if (loginPage && loginPage.classList.contains('active')) {{
+            var loggedIn = platformData.filter(function(p) {{ return p.supported && p.logged_in; }});
+            if (loggedIn.length > 0) {{
+                // 静默检测（不锁按钮）
+                var j = 0;
+                function nextSilent() {{
+                    if (j >= loggedIn.length) return;
+                    checkPlatformCookie(loggedIn[j].id);
+                    j++;
+                    if (j < loggedIn.length) setTimeout(nextSilent, 800);
+                }}
+                nextSilent();
+            }}
+        }}
+    }}, 30000);
+}}
+
+/** 停止自动检测 */
+function stopAutoCookieCheck() {{
+    if (_autoCheckTimer) {{ clearInterval(_autoCheckTimer); _autoCheckTimer = null; }}
 }}
 
 /** 渲染账号列表项 HTML */
@@ -4042,6 +4248,8 @@ async function doPublish() {{
     const btn = document.getElementById("publishBtn");
     btn.disabled = true;
     btn.querySelector(".btn-text").textContent = "\\u23F3 \\u6B63\\u5728\\u53D1\\u5E03...";
+    // 移除平台按钮弹跳动画 -- 发布过程中不需要额外的视觉消耗
+    document.querySelectorAll(".platform-btn").forEach(function(b) {{ b.classList.remove("p-bounce", "p-shrink"); }});
 
     try {{
         const resp = await fetch("/api/upload", {{
@@ -4062,6 +4270,8 @@ async function doPublish() {{
         if (result.code === 0) {{
             showToast(`\\u5DF2\\u63D0\\u4EA4\\u5230 ${{result.data.total}} \\u4E2A\\u5E73\\u53F0\\u53D1\\u5E03\\u4EFB\\u52A1`, "success");
             startProgressPolling(selectedPlatforms);
+            // 发布提交后清除视频选择（标题/描述保留供复用）
+            clearPublishState();
 
         }} else {{
             showToast(result.msg || "\\u53D1\\u5E03\\u8BF7\\u6C42\\u5931\\u8D25", "error");
@@ -4476,7 +4686,7 @@ function fireConfetti(count) {{
 // ============================================================
 // E4: 鼠标跟随光晕
 // ============================================================
-/* RAF 节流：鼠标跟随光晕 */
+/* RAF 节流：鼠标跟随光晕（使用 transform 定位，避免 left/top 触发布局重排） */
 var _glowRafId = null;
 var _glowPending = null;
 
@@ -4492,12 +4702,15 @@ function initCursorGlow() {{
         if (!_glowRafId) {{
             _glowRafId = requestAnimationFrame(function() {{
                 var p = _glowPending;
-                if (p) {{ glow.style.left = p.x + "px"; glow.style.top = p.y + "px"; }}
+                if (p) {{
+                    // 用 transform 定位，避免 left/top 触发布局重排
+                    glow.style.transform = 'translate(calc(' + p.x + 'px - 50%), calc(' + p.y + 'px - 50%))';
+                }}
                 _glowRafId = null;
             }});
         }}
         if (!visible) {{
-            glow.style.transition = "opacity 0.3s, left 0.15s ease-out, top 0.15s ease-out";
+            glow.style.transition = "opacity 0.3s";
             glow.style.opacity = "1";
             visible = true;
         }}

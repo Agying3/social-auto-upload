@@ -137,13 +137,29 @@ def main():
         logging.error(f"pywebview 导入失败: {e}")
         return
     
-    # 窗口配置
+    # ---- 窗口控制 JS API（暴露给前端调用）----
+    class WindowApi:
+        """无边框窗口控制 API —— 前端通过 window.pywebview.api.xxx() 调用"""
+        def minimize(self):
+            webview.windows[0].minimize()
+        def close(self):
+            webview.windows[0].destroy()
+
+    api = WindowApi()  # 必须以实例传入，pywebview 不会自动实例化类
+
+    # 创建窗口（frameless 模式）
     window = webview.create_window(
         title="Tujue AutoSend - 多平台视频一键发布",
         url=f"http://127.0.0.1:{PORT}",
         width=1100,
         height=780,
         min_size=(900, 600),
+        frameless=True,
+        easy_drag=True,
+        shadow=False,
+        transparent=False,
+        background_color='#000000',  # fallback（transparent=True 会覆盖为 Color.Transparent）
+        js_api=api,
     )
     
     logging.info("桌面窗口创建中...")

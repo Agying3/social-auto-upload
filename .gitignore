@@ -215,6 +215,12 @@ _*.png
 wallpapers/
 generated-images/
 
+# 测试截图
+test_*.png
+
+# 测试上传目录
+uploads/
+
 # 工作区记忆（WorkBuddy 内部）
 .workbuddy/
 

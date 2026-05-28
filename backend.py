@@ -5,6 +5,7 @@ Tujue AutoSend - 桌面版后端 API
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ import threading
 import traceback
 import uuid
 from datetime import datetime
+import time
 from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -187,12 +189,18 @@ def api_platforms():
         cookie_dir = COOKIES_DIR / info["uploader"]
         cookie_files = list(cookie_dir.glob("*.json")) if cookie_dir.exists() else []
         
+        # 获取最新 cookie 修改时间（前端用于显示登录时间）
+        cookie_modified = None
+        if cookie_files:
+            cookie_modified = max(f.stat().st_mtime for f in cookie_files)
+        
         result.append({
             "id": key,
             "name": info["name"],
             "logged_in": len(cookie_files) > 0,
             "account_count": len(cookie_files),
             "supported": True,     # social-auto-upload 支持的平台标记为 True
+            "cookie_modified": cookie_modified,  # 最新 cookie 修改时间戳
         })
 
     # 额外添加暂不支持的平台（占位）
@@ -312,9 +320,23 @@ def api_upload():
     valid_platforms = [p for p in platforms if p in PLATFORM_MAP]
     unsupported = [p for p in platforms if p not in PLATFORM_MAP]
 
-    # ---- 在后台线程中逐个上传 ----
+    # ---- 在后台线程中并发上传 ----
+    def _do_upload_sync(platform, video_path, title, desc, tags, publish_date, extra=None):
+        """单个平台上传的同步包装器（供线程池调用）"""
+        extra = extra or {}
+        try:
+            _do_upload(platform, video_path, title, desc, tags, publish_date, extra=extra)
+            set_platform_status(platform, "success", "✅ 发布成功")
+            return {"platform": platform, "status": "success", "msg": "发布成功"}
+        except Exception as e:
+            err_msg = str(e)
+            logging.error(f"[AutoSend] {PLATFORM_MAP.get(platform, {}).get('name', platform)} 上传失败: {err_msg}")
+            traceback.print_exc()
+            set_platform_status(platform, "error", f"❌ {err_msg}")
+            return {"platform": platform, "status": "error", "msg": err_msg}
+
     def upload_worker():
-        """上传工作线程：依次处理每个平台的发布任务"""
+        """上传工作线程：并发处理每个平台的发布任务"""
         # 创建一条初始的历史记录（pending 状态）
         history_record = {
             "video": video_path,
@@ -346,19 +368,36 @@ def api_upload():
         platform_details = []
 
         try:
+            # 读取并发数设置（默认 3）
+            settings = load_settings()
+            max_concurrent = settings.get("concurrent_uploads", 3)
+            max_concurrent = max(1, min(max_concurrent, len(valid_platforms)))
+
+            # 先设置所有平台为 "等待中"
             for platform in valid_platforms:
-                try:
-                    set_platform_status(platform, "uploading", "正在上传...")
+                set_platform_status(platform, "uploading", "正在上传...")
+
+            # 使用线程池并发执行
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+                futures = {}
+                for platform in valid_platforms:
                     extra = platform_extra.get(platform, {})
-                    _do_upload(platform, video_path, title, desc, tags, publish_date, extra=extra)
-                    set_platform_status(platform, "success", "✅ 发布成功")
-                    platform_details.append({"platform": platform, "status": "success", "msg": "发布成功"})
-                except Exception as e:
-                    err_msg = str(e)
-                    logging.error(f"[AutoSend] {PLATFORM_MAP.get(platform, {}).get('name', platform)} 上传失败: {err_msg}")
-                    traceback.print_exc()
-                    set_platform_status(platform, "error", f"❌ {err_msg}")
-                    platform_details.append({"platform": platform, "status": "error", "msg": err_msg})
+                    future = executor.submit(
+                        _do_upload_sync, platform, video_path, title, desc, tags, publish_date, extra
+                    )
+                    futures[future] = platform
+
+                # 按完成顺序收集结果
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        result = future.result()
+                        platform_details.append(result)
+                    except Exception as e:
+                        # 线程异常兜底
+                        plat = futures[future]
+                        logging.error(f"[AutoSend] {PLATFORM_MAP.get(plat, {}).get('name', plat)} 线程异常: {e}")
+                        set_platform_status(plat, "error", f"❌ {e}")
+                        platform_details.append({"platform": plat, "status": "error", "msg": str(e)})
 
             # 对不支持的平台标记
             for p in unsupported:
@@ -933,17 +972,29 @@ def api_login_status(session_id):
     return jsonify(resp)
 
 
+# Cookie 校验缓存（避免频繁启动浏览器）
+_cookie_check_cache = {}
+COOKIE_CHECK_CACHE_TTL = 300  # 5 分钟内不重复检测
+
+
 @app.route("/api/check-cookie/<platform>", methods=["GET"])
 def api_check_cookie(platform):
     """检查指定平台的 cookie 是否有效"""
     if platform not in PLATFORM_MAP:
         return jsonify({"code": 404, "msg": f"不支持的平台: {platform}"})
 
+    # 检查缓存（5 分钟内不重复检测）
+    cache_entry = _cookie_check_cache.get(platform)
+    if cache_entry and (time.time() - cache_entry["time"]) < COOKIE_CHECK_CACHE_TTL:
+        return jsonify({"code": 0, "data": cache_entry["data"]})
+
     cookie_dir = COOKIES_DIR / PLATFORM_MAP[platform]["uploader"]
     cookie_files = list(cookie_dir.glob("*.json")) if cookie_dir.exists() else []
 
     if not cookie_files:
-        return jsonify({"code": 0, "data": {"valid": False, "reason": "尚未登录"}})
+        result_data = {"valid": False, "reason": "尚未登录"}
+        _cookie_check_cache[platform] = {"data": result_data, "time": time.time()}
+        return jsonify({"code": 0, "data": result_data})
 
     # 异步校验 cookie
     try:
@@ -954,9 +1005,13 @@ def api_check_cookie(platform):
             from uploader.bilibili_uploader.main import cookie_auth as bili_cookie_auth
             try:
                 valid = loop.run_until_complete(bili_cookie_auth(str(cookie_files[0])))
-                return jsonify({"code": 0, "data": {"valid": valid, "reason": "" if valid else "cookie 已过期"}})
+                result_data = {"valid": valid, "reason": "" if valid else "cookie 已过期"}
+                _cookie_check_cache[platform] = {"data": result_data, "time": time.time()}
+                return jsonify({"code": 0, "data": result_data})
             except Exception as e:
-                return jsonify({"code": 0, "data": {"valid": False, "reason": str(e)}})
+                result_data = {"valid": False, "reason": str(e)}
+                _cookie_check_cache[platform] = {"data": result_data, "time": time.time()}
+                return jsonify({"code": 0, "data": result_data})
 
         if platform == "douyin":
             from uploader.douyin_uploader.main import cookie_auth
@@ -974,9 +1029,13 @@ def api_check_cookie(platform):
             valid = True  # 其他平台默认认为有效
 
         loop.close()
-        return jsonify({"code": 0, "data": {"valid": valid}})
+        result_data = {"valid": valid, "reason": "" if valid else "cookie 已过期"}
+        _cookie_check_cache[platform] = {"data": result_data, "time": time.time()}
+        return jsonify({"code": 0, "data": result_data})
     except Exception as e:
-        return jsonify({"code": 0, "data": {"valid": False, "reason": str(e)}})
+        result_data = {"valid": False, "reason": str(e)}
+        _cookie_check_cache[platform] = {"data": result_data, "time": time.time()}
+        return jsonify({"code": 0, "data": result_data})
 
 
 # ============================================================
