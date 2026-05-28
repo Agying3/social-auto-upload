@@ -4,7 +4,15 @@
 
 基于 [dreammis/social-auto-upload](https://github.com/dreammis/social-auto-upload) 开发，在原有 CLI / Agent 能力之上，新增 **桌面图形界面** 和 **单文件 EXE 打包**，让非技术用户也能开箱即用。
 
-<img src="media/show/tkupload.gif" alt="demo" width="800"/>
+## 📸 界面截图
+
+| 首页 | 发布页 |
+|------|--------|
+| ![首页](media/screenshot_home.png) | ![发布页](media/screenshot_publish.png) |
+
+| 登录管理 | 发布历史 | 系统设置 |
+|----------|----------|----------|
+| ![登录管理](media/screenshot_accounts.png) | ![发布历史](media/screenshot_history.png) | ![设置](media/screenshot_settings.png) |
 
 ## ✨ 与上游版本的区别
 
@@ -47,7 +55,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/YOUR_USERNAME/auto-send.git
+git clone https://github.com/Agying3/social-auto-upload.git
 cd auto-send
 
 # 2. 创建虚拟环境（Python 3.12）
