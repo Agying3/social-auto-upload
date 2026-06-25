@@ -161,7 +161,7 @@ async def cookie_auth(account_file):
             await migrate_storage_state_if_needed(context, account_file)
             context = await set_init_script(context)
             page = await context.new_page()
-            await page.goto(KUAISHOU_UPLOAD_URL)
+            await page.goto(KUAISHOU_UPLOAD_URL, timeout=60000, wait_until="domcontentloaded")
             if await _is_ks_cookie_invalid(page):
                 kuaishou_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
                 return False

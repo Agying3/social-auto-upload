@@ -87,22 +87,26 @@ async def cookie_auth(account_file):
     async with async_playwright() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(user_data_dir),
-            **build_persistent_launch_kwargs(headless=False),
+            **build_persistent_launch_kwargs(headless=True),
         )
         try:
             await migrate_storage_state_if_needed(context, account_file)
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto("https://creator.douyin.com/creator-micro/content/upload", timeout=60000, wait_until="domcontentloaded")
+            # 等待页面稳定（允许发生重定向，只要最终停在抖音创作者中心即可）
             try:
-                await page.wait_for_url("https://creator.douyin.com/creator-micro/content/upload", timeout=5000)
+                await page.wait_for_url("https://creator.douyin.com/creator-micro/**", timeout=10000)
             except Exception:
-                return False
+                pass  # 超时不直接判定失效，继续检查登录状态
 
             if await page.get_by_text("手机号登录").count() or await page.get_by_text("扫码登录").count():
                 return False
 
             return True
+        except Exception as exc:
+            douyin_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
+            return False
         finally:
             await context.close()
 
