@@ -5,7 +5,6 @@ Tujue AutoSend - 桌面版后端 API
 """
 
 import asyncio
-import concurrent.futures
 import json
 import logging
 import os
@@ -83,6 +82,39 @@ PLATFORM_MAP = {
 # Cookie 目录约定（冻结模式在 %APPDATA%/TujueAutoSend/cookies）
 from conf import DATA_DIR
 COOKIES_DIR = DATA_DIR / "cookies"
+# 持久化浏览器用户数据目录（launch_persistent_context 使用）
+BROWSER_DATA_DIR = DATA_DIR / "browser_data"
+
+
+def _remove_browser_data(platform_uploader: str, account_name: str = ""):
+    """删除持久化浏览器用户数据目录（退出登录/重置时调用）
+
+    Args:
+        platform_uploader: 上传器目录名（如 "douyin_uploader"）
+        account_name: 账号名，空字符串表示删除该平台全部
+    """
+    base_dir = BROWSER_DATA_DIR / platform_uploader
+    if not base_dir.exists():
+        return []
+
+    removed = []
+    if account_name:
+        target = base_dir / account_name
+        if target.exists():
+            try:
+                shutil.rmtree(str(target))
+                removed.append(account_name)
+            except Exception as e:
+                logging.warning(f"[AutoSend] 删除浏览器数据目录失败 {target}: {e}")
+    else:
+        for item in base_dir.iterdir():
+            if item.is_dir():
+                try:
+                    shutil.rmtree(str(item))
+                    removed.append(item.name)
+                except Exception as e:
+                    logging.warning(f"[AutoSend] 删除浏览器数据目录失败 {item}: {e}")
+    return removed
 
 
 def requests_post_internal(url, json_data=None):
@@ -320,23 +352,17 @@ def api_upload():
     valid_platforms = [p for p in platforms if p in PLATFORM_MAP]
     unsupported = [p for p in platforms if p not in PLATFORM_MAP]
 
-    # ---- 在后台线程中并发上传 ----
-    def _do_upload_sync(platform, video_path, title, desc, tags, publish_date, extra=None):
-        """单个平台上传的同步包装器（供线程池调用）"""
-        extra = extra or {}
-        try:
-            _do_upload(platform, video_path, title, desc, tags, publish_date, extra=extra)
-            set_platform_status(platform, "success", "✅ 发布成功")
-            return {"platform": platform, "status": "success", "msg": "发布成功"}
-        except Exception as e:
-            err_msg = str(e)
-            logging.error(f"[AutoSend] {PLATFORM_MAP.get(platform, {}).get('name', platform)} 上传失败: {err_msg}")
-            traceback.print_exc()
-            set_platform_status(platform, "error", f"❌ {err_msg}")
-            return {"platform": platform, "status": "error", "msg": err_msg}
+    # ---- 在后台线程中 asyncio 并发上传 ----
+    # 读取线程分配方案（前端传入，如 {"douyin": 1, "bilibili": 2, "kuaishou": 1}）
+    thread_assignment = data.get("thread_assignment", {})
+    # 根据分配方案分组：{1: ["douyin", "kuaishou"], 2: ["bilibili"]}
+    thread_groups = {}
+    for platform in valid_platforms:
+        tid = thread_assignment.get(platform, 1)
+        thread_groups.setdefault(tid, []).append(platform)
 
     def upload_worker():
-        """上传工作线程：并发处理每个平台的发布任务"""
+        """上传工作线程：asyncio 并发处理多平台发布任务"""
         # 创建一条初始的历史记录（pending 状态）
         history_record = {
             "video": video_path,
@@ -350,10 +376,7 @@ def api_upload():
         }
         hr_resp = None
         try:
-            hr_resp = requests_post_internal(
-                "/api/history",
-                json_data=history_record
-            )
+            hr_resp = requests_post_internal("/api/history", json_data=history_record)
         except Exception as e:
             logging.warning(f"[AutoSend] 创建历史记录失败（非致命）: {e}")
 
@@ -364,57 +387,22 @@ def api_upload():
             except Exception as e:
                 logging.warning(f"[AutoSend] 解析历史记录ID失败（非致命）: {e}")
 
-        # 各平台详细结果
-        platform_details = []
-
+        # ---- asyncio 并发上传 ----
         try:
-            # 读取并发数设置（默认 3）
-            settings = load_settings()
-            max_concurrent = settings.get("concurrent_uploads", 3)
-            max_concurrent = max(1, min(max_concurrent, len(valid_platforms)))
-
-            # 先设置所有平台为 "等待中"
-            for platform in valid_platforms:
-                set_platform_status(platform, "uploading", "正在上传...")
-
-            # 使用线程池并发执行
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-                futures = {}
-                for platform in valid_platforms:
-                    extra = platform_extra.get(platform, {})
-                    future = executor.submit(
-                        _do_upload_sync, platform, video_path, title, desc, tags, publish_date, extra
-                    )
-                    futures[future] = platform
-
-                # 按完成顺序收集结果
-                for future in concurrent.futures.as_completed(futures):
-                    try:
-                        result = future.result()
-                        platform_details.append(result)
-                    except Exception as e:
-                        # 线程异常兜底
-                        plat = futures[future]
-                        logging.error(f"[AutoSend] {PLATFORM_MAP.get(plat, {}).get('name', plat)} 线程异常: {e}")
-                        set_platform_status(plat, "error", f"❌ {e}")
-                        platform_details.append({"platform": plat, "status": "error", "msg": str(e)})
-
-            # 对不支持的平台标记
-            for p in unsupported:
-                set_platform_status(p, "error", "⚠️ 暂不支持该平台")
-                platform_details.append({"platform": p, "status": "error", "msg": "暂不支持"})
-
+            platform_details = asyncio.run(_async_upload_all(
+                valid_platforms, video_path, title, desc, tags, publish_date,
+                platform_extra, thread_groups, unsupported
+            ))
         except Exception as outer_e:
-            # 上传循环本身出现意外异常（不应发生，但需要防护）
             logging.critical(f"[AutoSend] upload_worker 严重异常: {outer_e}")
             traceback.print_exc(file=sys.stderr) if sys.stderr else logging.critical(traceback.format_exc())
+            platform_details = [{"platform": p, "status": "error", "msg": str(outer_e)} for p in valid_platforms + unsupported]
 
-        # ---- 更新历史记录状态（无论成功失败都要执行）----
+        # ---- 更新历史记录状态 ----
         if record_id:
-            success_cnt = sum(1 for d in platform_details if d["status"] == "success")
-            error_cnt = sum(1 for d in platform_details if d["status"] == "error")
+            success_cnt = sum(1 for d in platform_details if d.get("status") == "success")
+            error_cnt = sum(1 for d in platform_details if d.get("status") == "error")
             final_status = "success" if error_cnt == 0 else ("partial" if success_cnt > 0 else "error")
-
             try:
                 requests_post_internal(
                     "/api/history/update/" + record_id,
@@ -437,11 +425,75 @@ def api_upload():
     })
 
 
-def _do_upload(platform: str, video_path: str, title: str, desc: str, tags: list, publish_date, extra: dict = None):
+# ============================================================
+# asyncio 并发上传核心
+# ============================================================
+
+async def _async_upload_all(valid_platforms, video_path, title, desc, tags, publish_date, platform_extra, thread_groups, unsupported):
     """
-    执行单个平台的上传操作
-    根据不同的平台导入对应的 uploader 类并调用
-    extra: 平台特定参数，如 bilibili 的 tid 等
+    asyncio 并发上传到多个平台
+    - valid_platforms: 已选平台列表
+    - thread_groups: {thread_id: [platform, ...]}  前端传入的线程分配方案
+    - 使用 Semaphore 控制并发数（= len(thread_groups)）
+    """
+    settings = load_settings()
+    max_concurrent = settings.get("concurrent_uploads", 2)
+    max_concurrent = max(1, min(max_concurrent, len(valid_platforms)))
+
+    # 先设置所有平台为 "等待中"
+    for platform in valid_platforms:
+        tid = _find_thread_for_platform(platform, thread_groups)
+        set_platform_status(platform, "uploading", f"等待中 (线程{tid})...")
+
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _worker(platform):
+        extra = platform_extra.get(platform, {})
+        tid = _find_thread_for_platform(platform, thread_groups)
+        async with sem:
+            try:
+                set_platform_status(platform, "uploading", f"上传中 (线程{tid})...")
+                await _do_upload_async(platform, video_path, title, desc, tags, publish_date, extra)
+                set_platform_status(platform, "success", f"发布成功 (线程{tid})")
+                return {"platform": platform, "status": "success", "msg": "发布成功"}
+            except Exception as e:
+                err_msg = str(e)
+                logging.error(f"[AutoSend] {PLATFORM_MAP.get(platform, {}).get('name', platform)} 上传失败: {err_msg}")
+                set_platform_status(platform, "error", f"失败 (线程{tid}): {err_msg[:20]}")
+                return {"platform": platform, "status": "error", "msg": err_msg}
+
+    # 发起所有协程
+    results = await asyncio.gather(*[_worker(p) for p in valid_platforms], return_exceptions=True)
+
+    # 处理结果
+    platform_details = []
+    for r in results:
+        if isinstance(r, Exception):
+            platform_details.append({"platform": "unknown", "status": "error", "msg": str(r)})
+        elif isinstance(r, dict):
+            platform_details.append(r)
+        else:
+            platform_details.append({"platform": "unknown", "status": "error", "msg": str(r)})
+
+    # 对不支持的平台标记
+    for p in unsupported:
+        set_platform_status(p, "error", "⚠️ 暂不支持该平台")
+        platform_details.append({"platform": p, "status": "error", "msg": "暂不支持"})
+
+    return platform_details
+
+
+def _find_thread_for_platform(platform, thread_groups):
+    """查找某平台归属的线程ID"""
+    for tid, plats in thread_groups.items():
+        if platform in plats:
+            return tid
+    return 1
+
+
+async def _do_upload_async(platform: str, video_path: str, title: str, desc: str, tags: list, publish_date, extra: dict = None):
+    """
+    async 单平台上传（直接 await uploader 的 async 方法，无需 event loop 包装）
     """
     extra = extra or {}
     cookie_dir = COOKIES_DIR / PLATFORM_MAP[platform]["uploader"]
@@ -450,109 +502,66 @@ def _do_upload(platform: str, video_path: str, title: str, desc: str, tags: list
     if not cookie_files:
         raise RuntimeError(f"{PLATFORM_MAP[platform]['name']} 尚未登录，请先扫码登录")
 
-    # 取第一个可用的 cookie 文件
     account_file = str(cookie_files[0])
-    
     logging.info(f"[AutoSend] 开始上传到 {PLATFORM_MAP[platform]['name']}: {title}")
 
-    # 根据平台类型创建对应的 Uploader 实例并调用上传方法
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    if platform == "douyin":
+        from uploader.douyin_uploader.main import DouYinVideo, DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
+        strategy = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
+        app_obj = DouYinVideo(
+            title=title, file_path=video_path, tags=tags, publish_date=publish_date,
+            account_file=account_file, desc=desc, publish_strategy=strategy, headless=False,
+        )
+        await app_obj.douyin_upload_video()
 
-    try:
-        if platform == "douyin":
-            from uploader.douyin_uploader.main import DouYinVideo, DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
-            strategy = DOUYIN_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
-            app_obj = DouYinVideo(
-                title=title,
-                file_path=video_path,
-                tags=tags,
-                publish_date=publish_date,
-                account_file=account_file,
-                desc=desc,
-                publish_strategy=strategy,
-                headless=False,  # 抖音 headless 模式下发布会被反爬拦截，必须 headed
-            )
-            loop.run_until_complete(app_obj.douyin_upload_video())
+    elif platform == "kuaishou":
+        from uploader.ks_uploader.main import KSVideo
+        app_obj = KSVideo(
+            title=title, file_path=video_path, tags=tags, publish_date=publish_date,
+            account_file=account_file, desc=desc, headless=False,
+        )
+        await app_obj.main()
 
-        elif platform == "kuaishou":
-            from uploader.ks_uploader.main import KSVideo
-            app_obj = KSVideo(
-                title=title,
-                file_path=video_path,
-                tags=tags,
-                publish_date=publish_date,
-                account_file=account_file,
-                desc=desc,
-                headless=False,  # 快手 headless 模式下发布会被反爬拦截，必须 headed
-            )
-            loop.run_until_complete(app_obj.main())
+    elif platform == "tencent":
+        from uploader.tencent_uploader.main import TencentVideo, TENCENT_PUBLISH_STRATEGY_IMMEDIATE
+        strategy = TENCENT_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
+        app_obj = TencentVideo(
+            title=title, file_path=video_path, tags=tags, publish_date=publish_date,
+            account_file=account_file, desc=desc, publish_strategy=strategy, headless=False,
+        )
+        await app_obj.tencent_upload_video()
 
-        elif platform == "tencent":
-            from uploader.tencent_uploader.main import TencentVideo, TENCENT_PUBLISH_STRATEGY_IMMEDIATE
-            strategy = TENCENT_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
-            app_obj = TencentVideo(
-                title=title,
-                file_path=video_path,
-                tags=tags,
-                publish_date=publish_date,
-                account_file=account_file,
-                desc=desc,
-                publish_strategy=strategy,
-                headless=False,
-            )
-            loop.run_until_complete(app_obj.tencent_upload_video())
+    elif platform == "tiktok":
+        from uploader.tk_uploader.main import TiktokVideo
+        app_obj = TiktokVideo(
+            title=title, file_path=video_path, tags=tags, publish_date=publish_date,
+            account_file=account_file,
+        )
+        await app_obj.main()
 
-        elif platform == "tiktok":
-            from uploader.tk_uploader.main import TiktokVideo
-            app_obj = TiktokVideo(
-                title=title,
-                file_path=video_path,
-                tags=tags,
-                publish_date=publish_date,
-                account_file=account_file,
-            )
-            loop.run_until_complete(app_obj.main())
+    elif platform == "bilibili":
+        from uploader.bilibili_uploader.main import BilibiliVideo, BILIBILI_PUBLISH_STRATEGY_IMMEDIATE
+        tid = extra.get("tid", 21)
+        strategy = BILIBILI_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
+        app_obj = BilibiliVideo(
+            title=title, file_path=video_path, tags=tags, publish_date=publish_date,
+            account_file=account_file, desc=desc, tid=tid, publish_strategy=strategy, headless=False,
+        )
+        await app_obj.main()
 
-        elif platform == "bilibili":
-            # B站改用浏览器自动化上传（stream_gears API 已被封：投稿工具已停用）
-            from uploader.bilibili_uploader.main import BilibiliVideo, BILIBILI_PUBLISH_STRATEGY_IMMEDIATE
-            tid = extra.get("tid", 21)
-            strategy = BILIBILI_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
-            app_obj = BilibiliVideo(
-                title=title,
-                file_path=video_path,
-                tags=tags,
-                publish_date=publish_date,
-                account_file=account_file,
-                desc=desc,
-                tid=tid,
-                publish_strategy=strategy,
-                headless=False,  # B站需要 headed 模式
-            )
-            loop.run_until_complete(app_obj.main())
+    elif platform == "xhs":
+        from uploader.xiaohongshu_uploader.main import XiaoHongShuVideo, XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
+        strategy = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
+        app_obj = XiaoHongShuVideo(
+            title=title, file_path=video_path, tags=tags, publish_date=publish_date,
+            account_file=account_file, desc=desc, publish_strategy=strategy, headless=False,
+        )
+        await app_obj.xiaohongshu_upload_video()
 
-        elif platform == "xhs":
-            from uploader.xiaohongshu_uploader.main import XiaoHongShuVideo, XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
-            strategy = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE if publish_date == 0 else "scheduled"
-            app_obj = XiaoHongShuVideo(
-                title=title,
-                file_path=video_path,
-                tags=tags,
-                publish_date=publish_date,
-                account_file=account_file,
-                desc=desc,
-                publish_strategy=strategy,
-                headless=False,  # 小红书需要 headed 模式
-            )
-            loop.run_until_complete(app_obj.xiaohongshu_upload_video())
+    else:
+        raise RuntimeError(f"未知平台: {platform}")
 
-        else:
-            raise RuntimeError(f"未知平台: {platform}")
-
-    finally:
-        loop.close()
-        logging.info(f"[AutoSend] {PLATFORM_MAP[platform]['name']} 上传完成")
+    logging.info(f"[AutoSend] {PLATFORM_MAP[platform]['name']} 上传完成")
 
 
 @app.route("/api/status", methods=["GET"])
@@ -781,6 +790,13 @@ def api_logout(platform):
             removed.append(account_name)
         except Exception as e:
             return jsonify({"code": 500, "msg": f"删除 {account_name} 的登录信息失败: {e}"})
+
+    # 同时删除持久化浏览器用户数据目录
+    uploader_name = PLATFORM_MAP[platform]["uploader"]
+    if target_account:
+        _remove_browser_data(uploader_name, target_account)
+    else:
+        _remove_browser_data(uploader_name)
 
     if not removed:
         return jsonify({"code": 404, "msg": f"未找到账号 {target_account}"})
@@ -1189,7 +1205,7 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 # 默认配置
 DEFAULT_SETTINGS = {
     "browser_mode": "headed",           # headed(有头) / headless(无头)
-    "concurrent_uploads": 3,            # 并发上传数（同时上传的平台数）
+    "concurrent_uploads": 2,            # asyncio 并发上传数（Semaphore 控制）
     "default_tags": ["热门推荐", "精彩瞬间", "干货分享"],  # 默认标签列表
     "auto_retry": True,                 # 上传失败是否自动重试
     "retry_count": 2,                   # 重试次数
@@ -1228,6 +1244,14 @@ def api_get_settings():
         for cf in COOKIES_DIR.rglob("*"):
             if cf.is_file():
                 cache_size += cf.stat().st_size
+    # 也计算持久化浏览器数据目录的大小
+    if BROWSER_DATA_DIR.exists():
+        for cf in BROWSER_DATA_DIR.rglob("*"):
+            if cf.is_file():
+                try:
+                    cache_size += cf.stat().st_size
+                except Exception:
+                    pass
 
     # 格式化大小
     def fmt_size(b):
@@ -1296,6 +1320,12 @@ def api_cache_clear():
                 removed_count += 1
             except Exception as e:
                 return jsonify({"code": 500, "msg": f"删除失败 {cf.name}: {e}"})
+        # 同时清除全部持久化浏览器数据
+        if BROWSER_DATA_DIR.exists():
+            try:
+                shutil.rmtree(str(BROWSER_DATA_DIR))
+            except Exception:
+                pass
     else:
         # 只清除指定平台的 cookie
         for plat_id in target_platforms:
@@ -1310,6 +1340,8 @@ def api_cache_clear():
                         removed_count += 1
                     except Exception as e:
                         return jsonify({"code": 500, "msg": f"删除失败 {cf.name}: {e}"})
+            # 同时清除该平台的持久化浏览器数据
+            _remove_browser_data(PLATFORM_MAP[plat_id]["uploader"])
 
     logging.info(f"[AutoSend] 缓存已清理: {removed_count} 个文件")
     return jsonify({
@@ -1321,7 +1353,7 @@ def api_cache_clear():
 
 @app.route("/api/reset/all", methods=["POST"])
 def api_reset_all():
-    """一键清除所有使用痕迹（cookies + settings + history + wallpapers）"""
+    """一键清除所有使用痕迹（cookies + browser_data + settings + history + wallpapers）"""
     import shutil
     removed = {}
 
@@ -1336,6 +1368,14 @@ def api_reset_all():
                 except Exception:
                     pass
         removed["cookies"] = count
+
+    # 1.5 清除持久化浏览器用户数据目录
+    if BROWSER_DATA_DIR.exists():
+        try:
+            shutil.rmtree(str(BROWSER_DATA_DIR))
+            removed["browser_data"] = True
+        except Exception:
+            removed["browser_data"] = False
 
     # 2. 重置 settings.json 为默认值
     if SETTINGS_FILE.exists():

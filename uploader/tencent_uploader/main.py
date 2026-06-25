@@ -13,7 +13,7 @@ from patchright.async_api import async_playwright
 
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
-from utils.base_social_media import set_init_script
+from utils.base_social_media import set_init_script, get_user_data_dir, migrate_storage_state_if_needed, build_persistent_launch_kwargs
 from utils.log import tencent_logger
 
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
@@ -106,78 +106,86 @@ def format_str_for_short_title(origin_title: str) -> str:
     return formatted_string
 
 
+async def _check_tencent_cookie_inline(page: Page) -> bool:
+    """在当前页面上检测视频号登录状态（不新建浏览器）"""
+    # 方法 1：检查 Wujie shadow DOM
+    login_status = await page.evaluate("""() => {
+        const wujieApp = document.querySelector('wujie-app');
+        if (!wujieApp || !wujieApp.shadowRoot) {
+            return { hasWujie: false, needLogin: null };
+        }
+
+        const sr = wujieApp.shadowRoot;
+
+        // 检查是否有扫码登录提示
+        const loginElements = sr.querySelectorAll('*');
+        for (const el of loginElements) {
+            const text = (el.textContent || '').trim();
+            if (text.includes('扫码登录') && el.offsetWidth > 0) {
+                return { hasWujie: true, needLogin: true };
+            }
+        }
+
+        // 检查是否有发表视频按钮（已登录标志）
+        const buttons = sr.querySelectorAll('button');
+        for (const btn of buttons) {
+            const text = (btn.textContent || '').trim();
+            if (text.includes('发表视频') || text.includes('发表')) {
+                return { hasWujie: true, needLogin: false };
+            }
+        }
+
+        return { hasWujie: true, needLogin: null };
+    }""")
+
+    # 如果 shadow DOM 明确判断了登录状态，直接返回
+    if login_status.get("needLogin") is True:
+        tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
+        return False
+    if login_status.get("needLogin") is False:
+        tencent_logger.success(_msg("🥳", "cookie 有效"))
+        return True
+
+    # 方法 2：降级到传统页面选择器
+    if await page.get_by_text("扫码登录", exact=True).count():
+        tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
+        return False
+
+    # 如果有「发表视频」文字或「发表」按钮，说明已登录
+    if await page.get_by_text("发表视频", exact=True).count():
+        tencent_logger.success(_msg("🥳", "cookie 有效"))
+        return True
+
+    if await page.get_by_role("button", name="发表").count():
+        tencent_logger.success(_msg("🥳", "cookie 有效"))
+        return True
+
+    # 无法确定，按失效处理
+    tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
+    return False
+
+
 async def cookie_auth(account_file):
     account_file = _resolve_account_file(account_file)
+    user_data_dir = get_user_data_dir(account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=True))
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=True),
+        )
         try:
-            context = await browser.new_context(storage_state=account_file)
+            await migrate_storage_state_if_needed(context, account_file)
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto("https://channels.weixin.qq.com/platform")
             # 等待页面加载（Wujie 微前端需要时间渲染）
             await asyncio.sleep(8)
-
-            # 方法 1：检查 Wujie shadow DOM
-            login_status = await page.evaluate("""() => {
-                const wujieApp = document.querySelector('wujie-app');
-                if (!wujieApp || !wujieApp.shadowRoot) {
-                    return { hasWujie: false, needLogin: null };
-                }
-
-                const sr = wujieApp.shadowRoot;
-
-                // 检查是否有扫码登录提示
-                const loginElements = sr.querySelectorAll('*');
-                for (const el of loginElements) {
-                    const text = (el.textContent || '').trim();
-                    if (text.includes('扫码登录') && el.offsetWidth > 0) {
-                        return { hasWujie: true, needLogin: true };
-                    }
-                }
-
-                // 检查是否有发表视频按钮（已登录标志）
-                const buttons = sr.querySelectorAll('button');
-                for (const btn of buttons) {
-                    const text = (btn.textContent || '').trim();
-                    if (text.includes('发表视频') || text.includes('发表')) {
-                        return { hasWujie: true, needLogin: false };
-                    }
-                }
-
-                return { hasWujie: true, needLogin: null };
-            }""")
-
-            # 如果 shadow DOM 明确判断了登录状态，直接返回
-            if login_status.get("needLogin") is True:
-                tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
-                return False
-            if login_status.get("needLogin") is False:
-                tencent_logger.success(_msg("🥳", "cookie 有效"))
-                return True
-
-            # 方法 2：降级到传统页面选择器
-            if await page.get_by_text("扫码登录", exact=True).count():
-                tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
-                return False
-
-            # 如果有「发表视频」文字或「发表」按钮，说明已登录
-            if await page.get_by_text("发表视频", exact=True).count():
-                tencent_logger.success(_msg("🥳", "cookie 有效"))
-                return True
-
-            if await page.get_by_role("button", name="发表").count():
-                tencent_logger.success(_msg("🥳", "cookie 有效"))
-                return True
-
-            # 无法确定，按失效处理
-            tencent_logger.info(_msg("🥹", "cookie 已失效，得重新登录一下"))
-            return False
+            return await _check_tencent_cookie_inline(page)
         except Exception as exc:
             tencent_logger.warning(_msg("😵", f"cookie 校验时出错，按失效处理: {exc}"))
             return False
         finally:
-            await browser.close()
+            await context.close()
 
 
 async def _extract_tencent_qrcode_src(page: Page) -> str:
@@ -502,11 +510,14 @@ async def tencent_cookie_gen(
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
     account_file = _resolve_account_file(account_file)
+    user_data_dir = get_user_data_dir(account_file)
     Path(account_file).parent.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=headless))
-        context = await browser.new_context()
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=headless),
+        )
         qrcode_path = None
         result = _build_login_result(False, "failed", "视频号登录失败", account_file)
         try:
@@ -525,16 +536,27 @@ async def tencent_cookie_gen(
             )
             if result["success"]:
                 await asyncio.sleep(2)
-                await context.storage_state(path=account_file)
-                if not await cookie_auth(account_file):
-                    result = _build_login_result(
-                        False,
-                        "cookie_invalid",
-                        "视频号扫码流程结束，但 cookie 校验失败",
-                        account_file,
-                        qrcode_info,
-                        page.url,
-                    )
+                # 持久化上下文自动保存状态；同时导出 storage_state 作为备份
+                try:
+                    await context.storage_state(path=account_file)
+                except Exception:
+                    pass
+                # 用当前 context 做 cookie 校验（避免开第二个浏览器抢占 user_data_dir）
+                verify_page = await context.new_page()
+                try:
+                    await verify_page.goto("https://channels.weixin.qq.com/platform")
+                    await asyncio.sleep(8)
+                    if not await _check_tencent_cookie_inline(verify_page):
+                        result = _build_login_result(
+                            False,
+                            "cookie_invalid",
+                            "视频号扫码流程结束，但 cookie 校验失败",
+                            account_file,
+                            qrcode_info,
+                            page.url,
+                        )
+                finally:
+                    await verify_page.close()
             return result
         except Exception as exc:
             result = _build_login_result(
@@ -552,7 +574,6 @@ async def tencent_cookie_gen(
             if not result["success"]:
                 tencent_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
 
 
 async def tencent_setup(
@@ -1305,8 +1326,12 @@ class TencentVideo(TencentBaseUploader):
         await self.validate_upload_args()
         tencent_logger.info(_msg("🥳", "上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
+        user_data_dir = get_user_data_dir(self.account_file)
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=self.headless),
+        )
+        await migrate_storage_state_if_needed(context, self.account_file)
 
         try:
             page = await context.new_page()
@@ -1324,11 +1349,13 @@ class TencentVideo(TencentBaseUploader):
             await self.set_short_title(page, self.title, self.short_title)
             await self.submit_publish(page)
 
-            await context.storage_state(path=self.account_file)
+            try:
+                await context.storage_state(path=self.account_file)
+            except Exception:
+                pass
             tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()
-            await browser.close()
 
     async def tencent_upload_video(self):
         async with async_playwright() as playwright:
@@ -1408,8 +1435,12 @@ class TencentNote(TencentBaseUploader):
         await self.validate_upload_args()
         tencent_logger.info(_msg("🥳", "图文上传前检查通过"))
 
-        browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
-        context = await browser.new_context(storage_state=self.account_file)
+        user_data_dir = get_user_data_dir(self.account_file)
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=self.headless),
+        )
+        await migrate_storage_state_if_needed(context, self.account_file)
         context = await set_init_script(context)
 
         try:
@@ -1424,11 +1455,13 @@ class TencentNote(TencentBaseUploader):
 
             await self.submit_publish(page)
 
-            await context.storage_state(path=self.account_file)
+            try:
+                await context.storage_state(path=self.account_file)
+            except Exception:
+                pass
             tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
             await context.close()
-            await browser.close()
 
     async def tencent_upload_note(self):
         async with async_playwright() as playwright:

@@ -13,7 +13,7 @@ from patchright.async_api import async_playwright
 
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
-from utils.base_social_media import set_init_script
+from utils.base_social_media import set_init_script, get_user_data_dir, migrate_storage_state_if_needed, build_persistent_launch_kwargs
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -83,15 +83,14 @@ def _build_login_result(success: bool, status: str, message: str, account_file: 
 
 
 async def cookie_auth(account_file):
+    user_data_dir = get_user_data_dir(account_file)
     async with async_playwright() as playwright:
-        launch_kwargs = {"headless": True, "args": ["--disable-gpu","--disable-dev-shm-usage","--no-sandbox","--disable-extensions","--disable-software-rasterizer"]}
-        if LOCAL_CHROME_PATH:
-            launch_kwargs["executable_path"] = LOCAL_CHROME_PATH
-        else:
-            launch_kwargs["channel"] = "chrome"
-        browser = await playwright.chromium.launch(**launch_kwargs)
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=False),
+        )
         try:
-            context = await browser.new_context(storage_state=account_file)
+            await migrate_storage_state_if_needed(context, account_file)
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto("https://creator.douyin.com/creator-micro/content/upload", timeout=60000, wait_until="domcontentloaded")
@@ -105,7 +104,7 @@ async def cookie_auth(account_file):
 
             return True
         finally:
-            await browser.close()
+            await context.close()
 
 
 async def douyin_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless: bool = LOCAL_CHROME_HEADLESS):
@@ -214,27 +213,12 @@ async def douyin_cookie_gen(
     max_checks: int = 100,
     headless: bool = LOCAL_CHROME_HEADLESS,
 ):
+    user_data_dir = get_user_data_dir(account_file)
     async with async_playwright() as playwright:
-        launch_kwargs = {
-            "headless": headless,
-            "args": [
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-software-rasterizer",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--metrics-recording-only",
-                "--no-first-run",
-            ],
-        }
-        if LOCAL_CHROME_PATH:
-            launch_kwargs["executable_path"] = LOCAL_CHROME_PATH
-        else:
-            launch_kwargs["channel"] = "chrome"
-        browser = await playwright.chromium.launch(**launch_kwargs)
-        context = await browser.new_context()
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=headless),
+        )
         context = await set_init_script(context)
         qrcode_path = None
         result = _build_login_result(False, "failed", "抖音登录失败", account_file)
@@ -271,16 +255,30 @@ async def douyin_cookie_gen(
             )
             if result["success"]:
                 await asyncio.sleep(2)
-                await context.storage_state(path=account_file)
-                if not await cookie_auth(account_file):
-                    result = _build_login_result(
-                        False,
-                        "cookie_invalid",
-                        "抖音扫码流程结束，但 cookie 校验失败",
-                        account_file,
-                        qrcode_info,
-                        page.url,
+                # 持久化上下文自动保存状态；同时导出 storage_state 作为备份
+                try:
+                    await context.storage_state(path=account_file)
+                except Exception:
+                    pass
+                # 用当前 context 做 cookie 校验（避免开第二个浏览器抢占 user_data_dir）
+                verify_page = await context.new_page()
+                try:
+                    await verify_page.goto(
+                        "https://creator.douyin.com/creator-micro/content/upload",
+                        timeout=60000, wait_until="domcontentloaded",
                     )
+                    if await verify_page.get_by_text("手机号登录").count() or \
+                       await verify_page.get_by_text("扫码登录").count():
+                        result = _build_login_result(
+                            False,
+                            "cookie_invalid",
+                            "抖音扫码流程结束，但 cookie 校验失败",
+                            account_file,
+                            qrcode_info,
+                            page.url,
+                        )
+                finally:
+                    await verify_page.close()
         except Exception as exc:
             result = _build_login_result(False, "failed", str(exc), account_file, current_url=page.url if "page" in locals() else "")
         finally:
@@ -289,7 +287,6 @@ async def douyin_cookie_gen(
             if not result["success"]:
                 douyin_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
         return result
 
 
@@ -644,7 +641,6 @@ class DouYinVideo(DouYinBaseUploader):
 
         while overall_retry < max_overall_retry:
             overall_retry += 1
-            browser = None
             context = None
             page = None
 
@@ -653,16 +649,12 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.warning(_msg("🔄", f"第 {overall_retry} 轮重试启动（最多 {max_overall_retry} 轮）"))
                     await asyncio.sleep(5)  # 重试前稍作休息
 
-                launch_kwargs = {"headless": self.headless, "args": ["--disable-gpu","--disable-dev-shm-usage","--no-sandbox","--disable-extensions","--disable-software-rasterizer"]}
-                if self.local_executable_path:
-                    launch_kwargs["executable_path"] = self.local_executable_path
-                else:
-                    launch_kwargs["channel"] = "chrome"
-                browser = await playwright.chromium.launch(**launch_kwargs)
-                context = await browser.new_context(
-                    storage_state=f"{self.account_file}",
-                    permissions=["geolocation"],
+                user_data_dir = get_user_data_dir(self.account_file)
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(user_data_dir),
+                    **build_persistent_launch_kwargs(headless=self.headless, executable_path=self.local_executable_path),
                 )
+                await migrate_storage_state_if_needed(context, self.account_file)
                 context = await set_init_script(context)
 
                 page = await context.new_page()
@@ -755,30 +747,81 @@ class DouYinVideo(DouYinBaseUploader):
                 while True:
                     try:
                         upload_state = await page.evaluate("""() => {
-                            const uploadingContainer = document.querySelector('[class*="uploading-container"]');
-                            const uploadProgress = document.querySelector('[class*="upload-progress"]');
-                            const uploadCards = document.querySelectorAll('[class*="upload-card"]');
-                            let isUploading = false;
+                            // ═══ 扩展上传进度检测（抖音页面常改版）═══
+                            const selectors = [
+                                '[class*="uploading-container"]',
+                                '[class*="upload-progress"]',
+                                '[class*="uploading"]',
+                                '[class*="progress-bar"]',
+                                '[class*="progress"]',
+                                '[class*="percent"]',
+                                '[class*="video-upload"]',
+                                '[class*="upload-card"]',
+                                '[class*="video-card"]',
+                                '[class*="file-card"]',
+                            ];
+                            let hasUploading = false;
                             let isFailed = false;
-                            for (const card of uploadCards) {
-                                const text = (card.innerText || '');
-                                if (text.includes('上传过程中')) isUploading = true;
-                                if (text.includes('上传失败')) isFailed = true;
-                            }
-                            const longCardDiv = document.querySelector('[class^="long-card"] div');
                             let hasReupload = false;
-                            if (longCardDiv && longCardDiv.innerText?.includes('重新上传')) {
-                                hasReupload = true;
+                            
+                            for (const sel of selectors) {
+                                try {
+                                    const el = document.querySelector(sel);
+                                    if (el && el.offsetWidth > 0) {
+                                        const text = (el.innerText || el.textContent || '').trim();
+                                        if (text.includes('上传中') || text.includes('上传进度') || text.includes('%')) {
+                                            hasUploading = true;
+                                        }
+                                        if (text.includes('上传失败')) isFailed = true;
+                                        if (text.includes('重新上传')) hasReupload = true;
+                                    }
+                                } catch(e) {}
                             }
-                            const progressDiv = document.querySelector('div.progress-div > div');
-                            let hasOldFailed = false;
-                            if (progressDiv && progressDiv.innerText?.includes('上传失败')) {
-                                hasOldFailed = true;
+                            
+                            // 检测 upload-card 元素
+                            const uploadCards = document.querySelectorAll('[class*="upload-card"], [class*="card"]');
+                            for (const card of uploadCards) {
+                                try {
+                                    const text = (card.innerText || '');
+                                    if (text.includes('上传过程中') || text.includes('上传中')) hasUploading = true;
+                                    if (text.includes('上传失败') || text.includes('失败')) isFailed = true;
+                                } catch(e) {}
                             }
+                            
+                            // 检测 long-card（上传完成 → 显示重新上传按钮）
+                            const longCardDiv = document.querySelector('[class^="long-card"] div, [class*="long-card"] div');
+                            if (longCardDiv) {
+                                try {
+                                    const t = longCardDiv.innerText || '';
+                                    if (t.includes('重新上传')) hasReupload = true;
+                                } catch(e) {}
+                            }
+                            
+                            // 检测 progress-div
+                            const progressDiv = document.querySelector('div.progress-div > div, [class*="progress"] div');
+                            if (progressDiv) {
+                                try {
+                                    const t = progressDiv.innerText || '';
+                                    if (t.includes('上传失败')) isFailed = true;
+                                    if (t.includes('%')) hasUploading = true;
+                                } catch(e) {}
+                            }
+                            
+                            // ═══ 额外诊断：统计页面上所有可见文本（前 20 行）═══
+                            let pageSummary = '';
+                            try {
+                                const body = document.querySelector('[class*="content"], [class*="main"], main, body');
+                                if (body) {
+                                    const lines = (body.innerText || '').split('\\n').filter(l => l.trim()).slice(0, 20);
+                                    pageSummary = lines.join(' | ');
+                                }
+                            } catch(e) {}
+                            
                             return {
-                                hasUploading: !!uploadingContainer || !!uploadProgress || isUploading,
-                                isFailed: isFailed || hasOldFailed,
+                                hasUploading: hasUploading,
+                                isFailed: isFailed,
                                 hasReupload: hasReupload,
+                                pageSummary: pageSummary.substring(0, 200),
                             };
                         }""")
 
@@ -808,7 +851,21 @@ class DouYinVideo(DouYinBaseUploader):
                     upload_wait_count += 1
                     if upload_wait_count >= max_upload_wait:
                         douyin_logger.error(_msg("😵", f"上传等待超时（{max_upload_wait * 2}秒），强制结束等待"))
+                        # 诊断：输出页面摘要
+                        try:
+                            diag = await page.evaluate("() => (document.body?.innerText || '').substring(0, 300)")
+                            douyin_logger.info(_msg("🔍", f"页面诊断: {diag}"))
+                        except Exception:
+                            pass
                         break
+                    # 每 5 轮未开始上传时输出诊断
+                    if not upload_started and upload_wait_count == 5:
+                        try:
+                            page_text = upload_state.get("pageSummary", "")
+                            if page_text:
+                                douyin_logger.info(_msg("🔍", f"上传诊断({upload_wait_count}轮): {page_text}"))
+                        except Exception:
+                            pass
                     # 每 10 轮检查一次浏览器是否还活着
                     if upload_wait_count % 10 == 0 and not await _check_browser_alive(page):
                         douyin_logger.error(_msg("😵", "浏览器在上传过程中意外断开"))
@@ -942,11 +999,13 @@ class DouYinVideo(DouYinBaseUploader):
                     raise RuntimeError(f"发布按钮循环超时（{max_publish_attempts} 次尝试均未成功）")
 
                 # 成功：更新 cookie 并正常退出
-                await context.storage_state(path=self.account_file)
+                try:
+                    await context.storage_state(path=self.account_file)
+                except Exception:
+                    pass
                 douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
                 await context.close()
-                await browser.close()
                 return  # 成功完成，退出整体重试循环
 
             except Exception as e:
@@ -961,15 +1020,10 @@ class DouYinVideo(DouYinBaseUploader):
                     except Exception:
                         pass
             finally:
-                # 确保浏览器被关闭（无论成功还是失败）
+                # 确保浏览器上下文被关闭（无论成功还是失败）
                 if context:
                     try:
                         await context.close()
-                    except Exception:
-                        pass
-                if browser:
-                    try:
-                        await browser.close()
                     except Exception:
                         pass
 
@@ -1124,7 +1178,6 @@ class DouYinNote(DouYinBaseUploader):
 
         while overall_retry < max_overall_retry:
             overall_retry += 1
-            browser = None
             context = None
             page = None
 
@@ -1133,16 +1186,12 @@ class DouYinNote(DouYinBaseUploader):
                     douyin_logger.warning(_msg("🔄", f"图文第 {overall_retry} 轮重试"))
                     await asyncio.sleep(5)
 
-                launch_kwargs = {"headless": self.headless, "args": ["--disable-gpu","--disable-dev-shm-usage","--no-sandbox","--disable-extensions","--disable-software-rasterizer"]}
-                if self.local_executable_path:
-                    launch_kwargs["executable_path"] = self.local_executable_path
-                else:
-                    launch_kwargs["channel"] = "chrome"
-                browser = await playwright.chromium.launch(**launch_kwargs)
-                context = await browser.new_context(
-                    storage_state=f"{self.account_file}",
-                    permissions=["geolocation"],
+                user_data_dir = get_user_data_dir(self.account_file)
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(user_data_dir),
+                    **build_persistent_launch_kwargs(headless=self.headless, executable_path=self.local_executable_path),
                 )
+                await migrate_storage_state_if_needed(context, self.account_file)
                 context = await set_init_script(context)
 
                 page = await context.new_page()
@@ -1153,11 +1202,13 @@ class DouYinNote(DouYinBaseUploader):
                 await self.upload_note_content(page)
 
                 # 成功：更新 cookie 并正常退出
-                await context.storage_state(path=self.account_file)
+                try:
+                    await context.storage_state(path=self.account_file)
+                except Exception:
+                    pass
                 douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
                 await asyncio.sleep(2)
                 await context.close()
-                await browser.close()
                 return  # 成功，退出重试循环
 
             except Exception as e:
@@ -1172,11 +1223,6 @@ class DouYinNote(DouYinBaseUploader):
                 if context:
                     try:
                         await context.close()
-                    except Exception:
-                        pass
-                if browser:
-                    try:
-                        await browser.close()
                     except Exception:
                         pass
 

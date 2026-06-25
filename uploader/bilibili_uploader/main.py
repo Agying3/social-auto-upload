@@ -21,7 +21,7 @@ from patchright.async_api import async_playwright
 
 from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
-from utils.base_social_media import set_init_script
+from utils.base_social_media import set_init_script, get_user_data_dir, migrate_storage_state_if_needed, build_persistent_launch_kwargs
 from utils.log import bilibili_logger
 
 BILIBILI_UPLOAD_URL = "https://member.bilibili.com/platform/upload/video/frame"
@@ -91,15 +91,14 @@ def _build_login_result(success, status, message, account_file, qrcode=None, cur
 
 async def cookie_auth(account_file):
     """校验 B站 cookie 是否有效"""
+    user_data_dir = get_user_data_dir(account_file)
     async with async_playwright() as playwright:
-        launch_kwargs = {"headless": True, "args": ["--disable-gpu","--disable-dev-shm-usage","--no-sandbox","--disable-extensions","--disable-software-rasterizer"]}
-        if LOCAL_CHROME_PATH:
-            launch_kwargs["executable_path"] = LOCAL_CHROME_PATH
-        else:
-            launch_kwargs["channel"] = "chrome"
-        browser = await playwright.chromium.launch(**launch_kwargs)
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=False),
+        )
         try:
-            context = await browser.new_context(storage_state=account_file)
+            await migrate_storage_state_if_needed(context, account_file)
             context = await set_init_script(context)
             page = await context.new_page()
             await page.goto(BILIBILI_HOME_URL, timeout=60000, wait_until="domcontentloaded")
@@ -119,7 +118,7 @@ async def cookie_auth(account_file):
         except Exception:
             return False
         finally:
-            await browser.close()
+            await context.close()
 
 
 async def bilibili_setup(account_file, handle=False, return_detail=False, qrcode_callback=None, headless=False):
@@ -138,14 +137,12 @@ async def bilibili_setup(account_file, handle=False, return_detail=False, qrcode
 
 async def bilibili_cookie_gen(account_file, qrcode_callback=None, headless=False):
     """通过浏览器扫码登录B站，保存 cookie"""
+    user_data_dir = get_user_data_dir(account_file)
     async with async_playwright() as playwright:
-        launch_kwargs = {"headless": headless, "args": ["--disable-gpu","--disable-dev-shm-usage","--no-sandbox","--disable-extensions","--disable-software-rasterizer"]}
-        if LOCAL_CHROME_PATH:
-            launch_kwargs["executable_path"] = LOCAL_CHROME_PATH
-        else:
-            launch_kwargs["channel"] = "chrome"
-        browser = await playwright.chromium.launch(**launch_kwargs)
-        context = await browser.new_context()
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            **build_persistent_launch_kwargs(headless=headless),
+        )
         context = await set_init_script(context)
         result = _build_login_result(False, "failed", "B站登录失败", account_file)
         try:
@@ -226,7 +223,10 @@ async def bilibili_cookie_gen(account_file, qrcode_callback=None, headless=False
                 if "passport.bilibili.com" not in current_url:
                     bilibili_logger.info(_msg("🥳", f"登录成功，已跳转到: {current_url}"))
                     await asyncio.sleep(2)
-                    await context.storage_state(path=account_file)
+                    try:
+                        await context.storage_state(path=account_file)
+                    except Exception:
+                        pass
                     result = _build_login_result(True, "success", "B站登录成功", account_file, current_url=current_url)
                     break
 
@@ -248,7 +248,6 @@ async def bilibili_cookie_gen(account_file, qrcode_callback=None, headless=False
             if not result["success"]:
                 bilibili_logger.error(_msg("😢", f"登录失败: {result['message']}"))
             await context.close()
-            await browser.close()
         return result
 
 
@@ -624,27 +623,58 @@ class BilibiliVideo(BaseVideoUploader):
             bilibili_logger.info(_msg("🏷️", f"标签已添加: {tag}"))
 
     async def _select_zone(self, page: Page, tid: int):
-        """选择分区
+        """选择分区（单级下拉框）
 
-        B站投稿页分区选择器的 DOM 结构：
+        B站投稿页分区选择器只有一个下拉框：
             <div class="form-item">
               <label>*分区</label>
               <div class="select-container">
                 <div class="select-controller">
-                  <p class="select-item-cont">动画</p>  ← 当前值
+                  <p class="select-item-cont">动画</p>
                 </div>
               </div>
             </div>
-        点击 .select-item-cont 展开下拉列表，然后选择分区。
-        tid 是分区 ID。
+
+        tid 是子分区 ID（如 24=MAD·AMV），直接在展开的下拉列表中点击对应选项即可。
         """
+        # tid → 分区名称映射（与 backend.py 的 BILIBILI_ZONES 同步）
+        _TID_NAMES = {
+            24: "MAD·AMV", 25: "MMD·3D", 47: "短片·手书·配音", 210: "手办·模玩",
+            86: "特摄", 253: "动漫杂谈", 27: "综合",
+            17: "单机游戏", 171: "电子竞技", 172: "手机游戏", 65: "网络游戏",
+            173: "桌游棋牌", 121: "GMV", 136: "音游", 19: "Mugen",
+            28: "原创音乐", 31: "翻唱", 59: "演奏", 30: "VOCALOID·UTAU",
+            29: "音乐现场", 193: "MV", 243: "乐评盘点", 244: "音乐教学", 130: "音乐综合",
+            20: "宅舞", 198: "街舞", 199: "明星舞蹈", 200: "中国舞", 154: "舞蹈综合", 156: "舞蹈教程",
+            201: "科学科普", 124: "社科·法律·心理", 228: "人文历史", 207: "财经商业",
+            208: "校园学习", 209: "职业职场", 229: "设计·创意", 122: "野生技能协会",
+            95: "数码", 230: "软件应用", 231: "计算机技术", 232: "科工机械",
+            182: "影视杂谈", 183: "影视剪辑", 85: "小剧场", 184: "预告·资讯",
+            71: "综艺", 241: "娱乐杂谈", 242: "粉丝创作", 137: "明星综合",
+            76: "美食制作", 212: "美食侦探", 213: "美食测评", 214: "田园美食", 215: "美食记录",
+            138: "搞笑", 250: "出行", 251: "三农", 239: "家居房产", 161: "手工", 162: "绘画", 21: "日常",
+            22: "鬼畜调教", 26: "音MAD", 126: "人力VOCALOID", 216: "鬼畜剧场", 127: "教程演示",
+            157: "美妆护肤", 252: "仿妆cos", 158: "穿搭", 159: "时尚潮流",
+            235: "篮球", 249: "足球", 164: "健身", 236: "竞技体育", 237: "运动文化", 238: "运动综合",
+            245: "赛车", 246: "改装玩车", 247: "新能源车", 248: "房车", 240: "摩托车", 227: "购车攻略", 176: "汽车生活",
+            218: "喵星人", 219: "汪星人", 220: "大熊猫", 221: "野生动物", 222: "爬宠", 75: "动物综合",
+            203: "热点", 204: "环球", 205: "社会", 206: "综合",
+        }
+
+        target_name = _TID_NAMES.get(tid, "")
+        if not target_name:
+            bilibili_logger.warning(_msg("⚠️", f"未知分区 tid={tid}，使用默认分区"))
+            return
+
         try:
+            bilibili_logger.info(_msg("📂", f"选择分区: tid={tid} → {target_name}"))
+
             # 滚动到分区区域
             try:
                 await page.evaluate("""() => {
                     const formItems = document.querySelectorAll('.form-item');
                     for (const item of formItems) {
-                        const label = item.querySelector('label, [class*="label"], h3, .section-title-content-main');
+                        const label = item.querySelector('label, [class*="label"], h3');
                         if (label && (label.textContent || '').includes('分区')) {
                             item.scrollIntoView({ block: 'center' });
                             break;
@@ -655,104 +685,135 @@ class BilibiliVideo(BaseVideoUploader):
             except Exception:
                 pass
 
-            # 点击分区选择器（.select-item-cont 是显示当前值的元素）
-            zone_selector = await _find_first_visible(page, [
-                '.select-item-cont',
-                '.select-controller',
-                '.select-container',
-            ], timeout_ms=5000)
+            # 点击分区下拉框，然后选择目标选项
+            for attempt in range(3):
+                try:
+                    # 点击 .select-item-cont 展开下拉
+                    click_result = await page.evaluate("""() => {
+                        const conts = document.querySelectorAll('.select-item-cont');
+                        for (const c of conts) {
+                            if (c.offsetWidth === 0) continue;
+                            c.click();
+                            return 'clicked: ' + (c.textContent || '').trim();
+                        }
+                        // fallback
+                        const ctrl = document.querySelector('.select-controller');
+                        if (ctrl && ctrl.offsetWidth > 0) { ctrl.click(); return 'ctrl_clicked'; }
+                        return 'not_found';
+                    }""")
 
-            if zone_selector:
-                await zone_selector.click()
-                await asyncio.sleep(1.5)
-                bilibili_logger.info(_msg("📂", f"已点击分区选择器（tid={tid}）"))
+                    if 'not_found' in str(click_result):
+                        bilibili_logger.warning(_msg("⚠️", f"未找到分区下拉框 (尝试{attempt+1})"))
+                        continue
 
-                # B站分区是级联选择（主分区→子分区），通过 API 获取分区数据更可靠
-                # 这里先尝试通过下拉列表点击
-                tid_names = {
-                    21: "科学科普", 24: "单机游戏", 95: "手机", 122: "野生技术协会",
-                    75: "综合", 136: "音MAD", 138: "搞笑", 25: "Mugen",
-                    27: "综合", 28: "原创音乐", 29: "三次元音乐", 30: "VOCALOID",
-                    31: "翻唱", 59: "演奏", 130: "舞蹈", 154: "三次元舞蹈",
-                    156: "舞蹈教程", 32: "完结动画", 33: "连载动画", 34: "资讯",
-                    36: "短剧", 82: "日记", 128: "手工", 167: "国创",
-                    # 主分区
-                    1: "番剧", 13: "动画", 3: "音乐", 129: "舞蹈",
-                    4: "游戏", 36: "知识", 188: "科技", 95: "生活",
-                    21: "美食", 119: "动物圈", 22: "鬼畜", 26: "时尚",
-                    23: "娱乐", 19: "影视", 217: "汽车", 181: "运动",
-                }
-                target_name = tid_names.get(tid, "")
+                    bilibili_logger.info(_msg("📂", f"分区下拉已展开: {click_result}"))
+                    await asyncio.sleep(1.5)
 
-                clicked = False
-                if target_name:
-                    # 等待下拉渲染
-                    await asyncio.sleep(1)
+                    # 在下拉列表中点击目标分区
+                    if await self._click_dropdown_option(page, target_name):
+                        bilibili_logger.info(_msg("📂", f"分区已选: {target_name}"))
+                        await asyncio.sleep(1)
 
-                    # 通过 JS 在下拉列表中查找并点击分区选项
-                    # B站下拉列表 DOM 可能是 .bcc-cascader-panel / .el-cascader-panel 等
-                    for attempt in range(3):
-                        js_result = await page.evaluate(f"""(targetName) => {{
-                            // 查找所有可见的下拉面板
-                            const panels = document.querySelectorAll(
-                                '.bcc-cascader-panel, .el-cascader-panel, ' +
-                                '[class*="cascader"], [class*="dropdown-menu"], ' +
-                                '[class*="select-dropdown"], [class*="picker-dropdown"]'
-                            );
-                            
-                            for (const panel of panels) {{
-                                if (panel.offsetWidth === 0) continue;
-                                
-                                // 在面板中查找目标文字
-                                const items = panel.querySelectorAll('li, [class*="item"], [class*="option"], span, div');
-                                for (const item of items) {{
-                                    const text = (item.textContent || '').trim();
-                                    // 精确匹配或以目标名称开头
-                                    if (text === targetName || text.startsWith(targetName + ' ')) {{
-                                        // 检查是否可见
-                                        if (item.offsetWidth > 0 && item.offsetHeight > 0) {{
-                                            // 触发 Vue 事件
-                                            const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
-                                            for (const type of events) {{
-                                                item.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}}));
-                                            }}
-                                            return 'clicked: ' + text;
-                                        }}
-                                    }}
-                                }}
-                            }}
-                            
-                            // 也检查页面所有可见元素中的分区文字
-                            const allEls = document.querySelectorAll('li, [class*="menu-item"], [class*="option"]');
-                            for (const el of allEls) {{
-                                const text = (el.textContent || '').trim();
-                                if (text === targetName && el.offsetWidth > 0 && el.offsetHeight > 0) {{
-                                    el.click();
-                                    return 'fallback_click: ' + text;
-                                }}
-                            }}
-                            
-                            return null;
-                        }}""", target_name)
-                        
-                        if js_result:
-                            bilibili_logger.info(_msg("📂", f"JS 选择分区: {js_result}"))
-                            clicked = True
-                            break
+                        # 验证
+                        final = await page.evaluate("""() => {
+                            const c = document.querySelector('.select-item-cont');
+                            return c ? (c.textContent || '').trim() : 'N/A';
+                        }""")
+                        bilibili_logger.info(_msg("📂", f"最终分区: {final}"))
+                        return
+                    else:
+                        bilibili_logger.warning(_msg("⚠️", f"下拉列表中未找到 '{target_name}' (尝试{attempt+1})"))
+                        await page.keyboard.press("Escape")
                         await asyncio.sleep(0.5)
-
-                if not clicked:
-                    bilibili_logger.warning(_msg("⚠️", f"未找到分区选项 '{target_name}'（tid={tid}），使用默认分区"))
-                    # 按 Escape 关闭可能打开的下拉
-                    await page.keyboard.press("Escape")
+                except Exception as e:
+                    bilibili_logger.warning(_msg("⚠️", f"分区选择尝试{attempt+1}失败: {e}"))
                     await asyncio.sleep(0.5)
 
-                await asyncio.sleep(1)
-            else:
-                bilibili_logger.info(_msg("📂", "未找到分区选择器，使用默认分区"))
+            bilibili_logger.warning(_msg("⚠️", f"分区选择失败，使用默认分区"))
 
         except Exception as e:
-            bilibili_logger.warning(_msg("⚠️", f"分区选择失败: {e}，使用默认分区"))
+            bilibili_logger.warning(_msg("⚠️", f"分区选择异常: {e}，使用默认分区"))
+
+    async def _click_dropdown_option(self, page: Page, target_text: str) -> bool:
+        """在下拉面板中点击指定文字的选项"""
+        js_result = await page.evaluate("""(targetName) => {
+            // 查找所有可见的下拉面板
+            const panelSelectors = [
+                '.bcc-cascader-panel', '.el-cascader-panel',
+                '[class*="cascader-panel"]', '[class*="cascader__panel"]',
+                '[class*="dropdown-menu"]', '[class*="select-dropdown"]',
+                '[class*="picker-dropdown"]', '[class*="popper"]',
+                '[role="listbox"]', '[class*="option-list"]',
+                'micro-app [class*="panel"]', 'micro-app [class*="dropdown"]',
+                'micro-app [class*="list"]',
+            ];
+
+            let panels = [];
+            for (const sel of panelSelectors) {
+                try {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        if (el.offsetWidth > 0 && el.offsetHeight > 0) panels.push(el);
+                    }
+                } catch(e) {}
+            }
+
+            // 也尝试在 micro-app shadow DOM 中查找
+            try {
+                const microApps = document.querySelectorAll('micro-app');
+                for (const ma of microApps) {
+                    const shadow = ma.shadowRoot;
+                    if (!shadow) continue;
+                    const innerPanels = shadow.querySelectorAll('[class*="panel"], [class*="dropdown"], [class*="list"]');
+                    for (const p of innerPanels) {
+                        const r = p.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) panels.push(p);
+                    }
+                }
+            } catch(e) {}
+
+            // 去重
+            const seen = new Set();
+            panels = panels.filter(p => { if (seen.has(p)) return false; seen.add(p); return true; });
+
+            for (const panel of panels) {
+                const candidates = panel.querySelectorAll('li, [class*="item"], [class*="option"], span, div, p');
+                for (const item of candidates) {
+                    const text = (item.textContent || '').trim();
+                    if (text === targetName || text.startsWith(targetName)) {
+                        if (item.offsetWidth > 0 || item.offsetHeight > 0 ||
+                            window.getComputedStyle(item).display !== 'none') {
+                            item.scrollIntoView({ block: 'nearest' });
+                            const events = ['mouseenter', 'mouseover', 'mousedown', 'mouseup', 'click'];
+                            for (const type of events) {
+                                item.dispatchEvent(new MouseEvent(type, {
+                                    bubbles: true, cancelable: true, view: window
+                                }));
+                            }
+                            return 'selected: ' + text;
+                        }
+                    }
+                }
+            }
+
+            // 兜底：整个文档中找
+            const allEls = document.querySelectorAll('li, [class*="menu-item"], [class*="option"], [class*="cascader-node"]');
+            for (const el of allEls) {
+                const text = (el.textContent || '').trim();
+                if ((text === targetName || text.includes(targetName)) &&
+                    el.offsetWidth > 0 && el.offsetHeight > 0) {
+                    el.click();
+                    return 'fallback: ' + text;
+                }
+            }
+
+            return null;
+        }""", target_text)
+
+        if js_result:
+            bilibili_logger.info(_msg("📂", f"下拉选项: {js_result}"))
+            return True
+        return False
 
     async def _set_copyright(self, page: Page, copyright_type: int = 2):
         """设置版权类型：1=原创，2=转载
@@ -789,6 +850,181 @@ class BilibiliVideo(BaseVideoUploader):
                         bilibili_logger.warning(_msg("⚠️", "找不到转载来源输入框，可能需要手动填写"))
         except Exception as e:
             bilibili_logger.warning(_msg("⚠️", f"设置版权类型失败: {e}"))
+
+    async def _select_declaration(self, page: Page):
+        """选择「创作声明」（B站新增强制必填项）
+
+        自 2025 年起 B站要求上传视频必须选择创作声明，否则提交按钮点击无响应。
+        选项包括：内容无需标注 / 含AI生成内容 / 含虚构演绎内容 / 内容含营销信息
+        默认选择「内容无需标注」。
+        """
+        try:
+            await asyncio.sleep(1)
+
+            # 查找「创作声明」相关的表单区域
+            declaration_area = await page.evaluate("""() => {
+                const formItems = document.querySelectorAll('.form-item, .form-section, [class*="declare"], [class*="statement"]');
+                for (const item of formItems) {
+                    const text = (item.textContent || '').trim();
+                    if (text.includes('创作声明') && item.offsetWidth > 0) {
+                        return {found: true, text: text.substring(0, 60)};
+                    }
+                }
+                // 也搜索整个页面
+                if (document.body.innerText.includes('创作声明')) {
+                    return {found: true, text: 'body_has_declaration'};
+                }
+                return {found: false};
+            }""")
+
+            if not declaration_area.get('found'):
+                bilibili_logger.info(_msg("📋", "未检测到「创作声明」字段，跳过（可能B站版本未要求）"))
+                return
+
+            bilibili_logger.info(_msg("📋", f"检测到「创作声明」字段: {declaration_area.get('text','')}"))
+
+            # 滚动到该区域
+            await page.evaluate("""() => {
+                const items = document.querySelectorAll('.form-item, .form-section, [class*="declare"], [class*="statement"]');
+                for (const item of items) {
+                    if ((item.textContent || '').includes('创作声明')) {
+                        item.scrollIntoView({block: 'center'});
+                        break;
+                    }
+                }
+            }""")
+            await asyncio.sleep(0.5)
+
+            # 查找创作声明的下拉选择器
+            # B站创作声明的 DOM 结构：通常在 .form-item 内有一个选择器
+            clicked_selector = await page.evaluate("""() => {
+                // 方法1: 找包含"创作声明"的 form-item 内的选择器
+                const formItems = document.querySelectorAll('.form-item, .form-section, [class*="declare"], [class*="statement"]');
+                for (const item of formItems) {
+                    if (!(item.textContent || '').includes('创作声明')) continue;
+                    if (item.offsetWidth === 0) continue;
+
+                    // 点击展开下拉的选择器
+                    const selectors = item.querySelectorAll(
+                        '.select-item-cont, .select-controller, .select-container, ' +
+                        '[class*="select"], [class*="dropdown"], [class*="picker"], ' +
+                        'input[type="text"], .ant-select-selector'
+                    );
+                    for (const sel of selectors) {
+                        if (sel.offsetWidth > 0 && sel.offsetHeight > 0) {
+                            sel.click();
+                            return 'clicked_in_declaration_area';
+                        }
+                    }
+                    
+                    // 如果找不到，尝试点击整个 form-item 内的可点击元素
+                    const clickables = item.querySelectorAll('div, span, p');
+                    for (const el of clickables) {
+                        if (el.offsetWidth > 0 && el.offsetHeight > 0 && el.textContent.trim().length < 50) {
+                            el.click();
+                            return 'clicked_generic';
+                        }
+                    }
+                }
+                
+                // 方法2: 直接搜索页面上"创作声明"文字附近的元素
+                const allElements = document.querySelectorAll('*');
+                for (const el of allElements) {
+                    if (el.childNodes.length === 1 && el.childNodes[0].nodeType === 3) {
+                        if ((el.textContent || '').trim() === '创作声明') {
+                            // 找到文字后，找它的父级 form-item
+                            let parent = el.parentElement;
+                            for (let i = 0; i < 10 && parent; i++) {
+                                const cls = (parent.className || '').toString();
+                                if (cls.includes('form-item') || cls.includes('item')) {
+                                    const selects = parent.querySelectorAll('[class*="select"], [class*="dropdown"], [class*="picker"]');
+                                    for (const s of selects) {
+                                        if (s.offsetWidth > 0) { s.click(); return 'clicked_parent_select'; }
+                                    }
+                                    break;
+                                }
+                                parent = parent.parentElement;
+                            }
+                        }
+                    }
+                }
+                return null;
+            }""")
+
+            if not clicked_selector:
+                bilibili_logger.warning(_msg("⚠️", "未找到创作声明选择器，尝试直接搜索..."))
+                # 最后尝试：直接点击「内容无需标注」
+                default_clicked = await page.evaluate("""() => {
+                    const allEls = document.querySelectorAll('span, div, p, label');
+                    for (const el of allEls) {
+                        if ((el.textContent || '').trim() === '内容无需标注' && el.offsetWidth > 0) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if default_clicked:
+                    bilibili_logger.info(_msg("✅", "直接点击「内容无需标注」成功"))
+                    return
+                else:
+                    bilibili_logger.warning(_msg("⚠️", "无法选择创作声明，跳过（提交可能会失败）"))
+                    return
+
+            bilibili_logger.info(_msg("📋", "已点击创作声明选择器，等待下拉..."))
+            await asyncio.sleep(1.5)
+
+            # 在下拉列表中选择「内容无需标注」
+            selected = await page.evaluate("""() => {
+                // 查找可见的下拉面板
+                const panels = document.querySelectorAll(
+                    '.bcc-select-dropdown, .el-select-dropdown, .ant-select-dropdown, ' +
+                    '[class*="dropdown"], [class*="popup"], [class*="menu"], ' +
+                    '[class*="option-list"], [class*="select-options"]'
+                );
+                
+                for (const panel of panels) {
+                    if (panel.offsetWidth === 0 || panel.offsetHeight === 0) continue;
+                    
+                    // 查找「内容无需标注」
+                    const items = panel.querySelectorAll('li, [class*="option"], [class*="item"], div, span');
+                    for (const item of items) {
+                        const text = (item.textContent || '').trim();
+                        if (text === '内容无需标注' && item.offsetWidth > 0 && item.offsetHeight > 0) {
+                            // 触发 Vue 事件
+                            ['mouseover', 'mousedown', 'mouseup', 'click'].forEach(type => {
+                                item.dispatchEvent(new MouseEvent(type, {
+                                    bubbles: true, cancelable: true, view: window,
+                                }));
+                            });
+                            return 'selected: 内容无需标注';
+                        }
+                    }
+                }
+                
+                // 如果下拉面板中找不到，直接在整个页面找
+                const allItems = document.querySelectorAll('li, [class*="option"], [class*="item"]');
+                for (const item of allItems) {
+                    if (item.textContent.trim() === '内容无需标注' && item.offsetWidth > 0) {
+                        item.click();
+                        return 'fallback_selected';
+                    }
+                }
+                
+                return null;
+            }""")
+
+            if selected:
+                bilibili_logger.info(_msg("✅", f"创作声明: {selected}"))
+            else:
+                # 按 Escape 关闭可能打开的下拉
+                await page.keyboard.press("Escape")
+                bilibili_logger.warning(_msg("⚠️", "未找到「内容无需标注」选项，创作声明可能未设置"))
+            
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            bilibili_logger.warning(_msg("⚠️", f"创作声明选择异常: {e}"))
 
     async def _click_publish(self, page: Page) -> bool:
         """点击发布/投稿按钮（只点一次，然后等待结果）
@@ -828,6 +1064,25 @@ class BilibiliVideo(BaseVideoUploader):
         # 重要：B站投稿按钮是 <span class="submit-add">立即投稿</span>，不是 <button>！
         # 需要先滚动到页面底部使其可见
         bilibili_logger.info(_msg("📤", "寻找投稿按钮..."))
+
+        # 先尝试隐藏侧边栏遮罩（B站创作中心左侧导航），防止遮挡投稿按钮
+        try:
+            await page.evaluate("""() => {
+                // 隐藏所有 mask/overlay 遮罩层（B站侧边栏导航）
+                const masks = document.querySelectorAll('[class*="mask"], [class*="overlay"], [class*="backdrop"]');
+                for (const m of masks) {
+                    if (m.offsetWidth > 0) {
+                        const txt = (m.textContent || '').trim();
+                        // 只隐藏侧边栏类型的遮罩（含导航文字），不隐藏弹窗
+                        if (txt.includes('首页') || txt.includes('投稿') || txt.includes('内容管理')) {
+                            m.style.display = 'none';
+                        }
+                    }
+                }
+            }""")
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
         
         # 先滚动到投稿按钮区域（submit-container 在页面底部）
         try:
@@ -896,39 +1151,82 @@ class BilibiliVideo(BaseVideoUploader):
             bilibili_logger.info(_msg("🔄", "尝试通过 JS 直接查找投稿按钮..."))
             try:
                 js_clicked = await page.evaluate("""() => {
-                    // B站投稿按钮是 <span class="submit-add">立即投稿</span>
-                    const submitAdd = document.querySelector('span.submit-add, .submit-add');
-                    if (submitAdd && submitAdd.offsetWidth > 0) {
-                        submitAdd.scrollIntoView({behavior: 'instant', block: 'center'});
-                        submitAdd.click();
-                        return 'submit-add: ' + (submitAdd.textContent || '').trim();
-                    }
-                    // 也搜索 span 元素
-                    const spans = document.querySelectorAll('span');
-                    for (const span of spans) {
-                        const text = (span.textContent || '').trim();
-                        if (text === '立即投稿' || text === '投稿') {
-                            span.scrollIntoView({behavior: 'instant', block: 'center'});
-                            span.click();
-                            return 'span: ' + text;
+                    // ═══ 先尝试关闭左侧导航遮罩（B站创作中心侧边栏）═══
+                    // 侧边栏可能覆盖了投稿按钮区域
+                    const masks = document.querySelectorAll('[class*="mask"], [class*="overlay"], [class*="backdrop"]');
+                    for (const m of masks) {
+                        if (m.offsetWidth > 0 && m.offsetHeight > 100) {
+                            // 尝试点击遮罩本身来关闭（移动端常见行为）
+                            const navDrawer = document.querySelector('.york_nav_drawer, [class*="drawer"], [class*="sidebar"]');
+                            if (navDrawer) {
+                                // 找侧边栏内的关闭/收起按钮
+                                const collapseBtn = navDrawer.querySelector('[class*="collapse"], [class*="fold"], [class*="toggle"]');
+                                if (collapseBtn) { collapseBtn.click(); }
+                            }
+                            // 点击导航外的区域来关闭（不要冒泡）
+                            m.click();
+                            break;  // 只关闭一次
                         }
                     }
-                    // 搜索 button 元素（兼容旧版）
-                    const btns = document.querySelectorAll('button');
-                    for (const btn of btns) {
-                        const text = (btn.textContent || '').trim();
-                        if (text === '投稿' || text === '立即投稿' || text.includes('投稿')) {
-                            btn.scrollIntoView({behavior: 'instant', block: 'center'});
-                            btn.click();
-                            return text;
+                    
+                    // ═══ 搜索投稿/发布按钮（扩展搜索范围）═══
+                    // 1. 专用选择器
+                    const selectors = [
+                        'span.submit-add', '.submit-add', 'button.submit-add',
+                        '[class*="submit"] span', '[class*="submit"] button',
+                        '.btn-submit', '.submit-btn',
+                        '.bcc-button--primary',
+                        '[class*="publish"]', '[class*="Publish"]',
+                    ];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                            const text = (el.textContent || '').trim();
+                            // 过滤掉非发布按钮（批量操作/添加分P等）
+                            if (!text.includes('批量') && !text.includes('添加分P') && !text.includes('草稿')) {
+                                el.scrollIntoView({behavior: 'instant', block: 'center'});
+                                el.click();
+                                return 'selector: ' + sel + ' => ' + text;
+                            }
                         }
                     }
-                    // 也尝试 bcc-button primary
-                    const primaryBtns = document.querySelectorAll('button.bcc-button--primary');
-                    for (const btn of primaryBtns) {
-                        if (!btn.classList.contains('small') && !btn.classList.contains('add')) {
-                            btn.click();
-                            return 'bcc-button--primary: ' + (btn.textContent || '').trim();
+                    
+                    // 2. 文本匹配（投稿/发布/提交）
+                    const publishTexts = ['立即投稿', '投稿', '立即发布', '发布', '提交', '确认发布'];
+                    for (const tag of ['span', 'button', 'a', 'div']) {
+                        const els = document.querySelectorAll(tag);
+                        for (const el of els) {
+                            const text = (el.textContent || '').trim();
+                            for (const pt of publishTexts) {
+                                if (text === pt && el.offsetWidth > 0) {
+                                    // 排除导航栏中的文本
+                                    const parent = el.closest('nav, .nav, .sidebar, .menu, .york_nav');
+                                    if (parent) continue;
+                                    el.scrollIntoView({behavior: 'instant', block: 'center'});
+                                    // dispatchEvent 触发 Vue 事件绑定
+                                    const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
+                                    for (const type of events) {
+                                        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                                    }
+                                    return tag + ': ' + text;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // 3. 搜索 submit-container 内的主按钮（兜底）
+                    const submitContainers = document.querySelectorAll('.submit-container, [class*="submit"], [class*="footer"]');
+                    for (const sc of submitContainers) {
+                        const btns = sc.querySelectorAll('span[class*="btn"], span[class*="button"], button');
+                        for (const btn of btns) {
+                            if (btn.offsetWidth > 0 && btn.offsetHeight > 0) {
+                                const text = (btn.textContent || '').trim();
+                                if (text && text.length <= 10 && !text.includes('取消') && !text.includes('批量')) {
+                                    btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                                    btn.click();
+                                    return 'container: ' + text;
+                                }
+                            }
                         }
                     }
                     return null;
@@ -944,43 +1242,57 @@ class BilibiliVideo(BaseVideoUploader):
             except Exception as js_err:
                 raise RuntimeError(f"找不到投稿按钮（JS 查找也失败: {js_err}）")
 
-        # Playwright 点击（仅在通过 _find_first_visible 找到按钮时执行）
+        # ═══ 点击投稿按钮 ═══
+        # 注意：B站使用 Vue.js，普通 click 和 force click 都触发不了 @click 事件处理器。
+        # 必须使用 dispatchEvent 配合完整的鼠标事件链来触发 Vue 的 @click。
+        #
+        # click 优先级：dispatchEvent (最优) → Playwright click (兼容) → force click (兜底)
         if publish_btn:
-            # 先确保按钮在视口内（B站投稿按钮在页面底部，可能需要滚动）
+            # 确保按钮在视口内
             try:
                 await publish_btn.evaluate("el => el.scrollIntoView({behavior: 'instant', block: 'center'})")
                 await asyncio.sleep(0.5)
             except Exception:
                 pass
 
-            # 尝试 Playwright 点击（先 force=True 避免视口/遮挡检查失败）
-            try:
-                await publish_btn.click(force=True, timeout=10000)
-                bilibili_logger.info(_msg("📤", "已点击投稿按钮 (Playwright force)"))
-            except Exception as click_err:
-                bilibili_logger.warning(_msg("⚠️", f"Playwright 点击失败，尝试 dispatchEvent: {click_err}"))
+            # 方式1: dispatchEvent 完整事件链（Vue.js 专用，最可靠）
+            bilibili_logger.info(_msg("🖱️", "优先使用 dispatchEvent 触发 Vue @click..."))
+            clicked_text = await page.evaluate("""() => {
+                const btn = document.querySelector('span.submit-add, .submit-add');
+                if (!btn || btn.offsetWidth === 0) return null;
+                btn.scrollIntoView({behavior: 'instant', block: 'center'});
+                // 完整鼠标事件链，触发 Vue @click 处理器
+                const rect = btn.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                const eventOpts = {
+                    bubbles: true, cancelable: true, view: window,
+                    clientX: cx, clientY: cy, screenX: cx, screenY: cy + 72,
+                    button: 0, buttons: 1,
+                };
+                btn.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+                btn.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+                btn.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+                btn.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+                btn.dispatchEvent(new MouseEvent('click', eventOpts));
+                return (btn.textContent || '').trim();
+            }""")
+            if clicked_text:
+                bilibili_logger.info(_msg("📤", f"dispatchEvent 已触发投稿按钮: {clicked_text}"))
+            else:
+                # 方式2: 降级到 Playwright 常规点击
+                bilibili_logger.warning(_msg("⚠️", "dispatchEvent 未找到按钮，降级 Playwright 点击"))
                 try:
-                    # 使用 dispatchEvent 触发 Vue 事件绑定（el.click() 对 Vue 无效）
-                    clicked = await page.evaluate("""() => {
-                        const btn = document.querySelector('span.submit-add, .submit-add');
-                        if (!btn) return null;
-                        btn.scrollIntoView({behavior: 'instant', block: 'center'});
-                        // 完整的鼠标事件链，触发 Vue @click 处理
-                        const events = ['mouseover', 'mousedown', 'mouseup', 'click'];
-                        for (const type of events) {
-                            btn.dispatchEvent(new MouseEvent(type, {
-                                bubbles: true, cancelable: true, view: window,
-                            }));
-                        }
-                        return btn.textContent;
-                    }""")
-                    if clicked:
-                        bilibili_logger.info(_msg("📤", f"dispatchEvent 点击投稿按钮成功: {clicked}"))
-                    else:
-                        raise RuntimeError("dispatchEvent 未找到按钮")
-                except Exception as js_err:
-                    bilibili_logger.error(_msg("😵", f"所有点击方式均失败: {js_err}"))
-                    raise RuntimeError(f"投稿按钮无法点击: {js_err}")
+                    await publish_btn.click(timeout=10000)
+                    bilibili_logger.info(_msg("📤", "已点击投稿按钮 (Playwright click)"))
+                except Exception as click_err1:
+                    # 方式3: force click 兜底
+                    try:
+                        await publish_btn.click(force=True, timeout=10000)
+                        bilibili_logger.info(_msg("📤", "已点击投稿按钮 (Playwright force)"))
+                    except Exception as click_err2:
+                        bilibili_logger.error(_msg("😵", f"所有点击方式均失败: {click_err2}"))
+                        raise RuntimeError(f"投稿按钮无法点击: {click_err2}")
 
         # ── 第二步：等待发布结果（最多 90 秒）──
         # 先等待几秒让页面响应，同时自动处理可能弹出的确认对话框
@@ -1317,7 +1629,12 @@ class BilibiliVideo(BaseVideoUploader):
                             const overlays = document.querySelectorAll('[class*="mask"], [class*="overlay"], [class*="backdrop"]');
                             for (const ov of overlays) {
                                 if (ov.offsetWidth > 0) {
-                                    // 有弹窗遮挡，不能判定
+                                    // ═══ 识别B站永久侧边栏（不是弹窗，不要误判）═══
+                                    const ovText = (ov.innerText || ov.textContent || '').trim();
+                                    if (ovText.includes('首页') && ovText.includes('内容管理') && ovText.includes('投稿')) {
+                                        return 'sidebar';  // 永久导航侧边栏，继续正常检测
+                                    }
+                                    // 检查是否是可关闭的弹窗
                                     const dialog = ov.parentElement || ov.closest('[class*="dialog"], [class*="modal"], [class*="popup"]');
                                     if (dialog) {
                                         const dt = (dialog.innerText || '').trim();
@@ -1359,6 +1676,10 @@ class BilibiliVideo(BaseVideoUploader):
                         if final_check in ('form_reset_final', 'again_btn', 'no_submit_btn_found'):
                             bilibili_logger.success(_msg("🥳", f"发布成功! (最终判定: {final_check})"))
                             return True
+                        elif final_check == 'sidebar':
+                            # 侧边栏是永久元素，不影响判定 → 继续等待
+                            bilibili_logger.info(_msg("🧹", "侧边栏遮罩(非弹窗)，继续等待发布结果"))
+                            no_change_count = 0  # 重置计数器，给更多时间
                         elif final_check == 'still_has_submit_btn':
                             bilibili_logger.warning(_msg("⚠️", "最终判定：投稿按钮仍存在且可用，可能未真正提交"))
                         elif final_check and final_check.startswith('blocked_by'):
@@ -1455,7 +1776,6 @@ class BilibiliVideo(BaseVideoUploader):
 
         while overall_retry < max_overall_retry:
             overall_retry += 1
-            browser = None
             context = None
             page = None
             publish_clicked = False  # 跟踪是否已点击投稿按钮
@@ -1465,15 +1785,12 @@ class BilibiliVideo(BaseVideoUploader):
                     bilibili_logger.warning(_msg("🔄", f"第 {overall_retry} 轮重试"))
                     await asyncio.sleep(5)
 
-                launch_kwargs = {"headless": self.headless, "args": ["--disable-gpu","--disable-dev-shm-usage","--no-sandbox","--disable-extensions","--disable-software-rasterizer"]}
-                if self.local_executable_path:
-                    launch_kwargs["executable_path"] = self.local_executable_path
-                else:
-                    launch_kwargs["channel"] = "chrome"
-                browser = await playwright.chromium.launch(**launch_kwargs)
-                context = await browser.new_context(
-                    storage_state=self.account_file,
+                user_data_dir = get_user_data_dir(self.account_file)
+                context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(user_data_dir),
+                    **build_persistent_launch_kwargs(headless=self.headless, executable_path=self.local_executable_path),
                 )
+                await migrate_storage_state_if_needed(context, self.account_file)
                 context = await set_init_script(context)
 
                 page = await context.new_page()
@@ -1557,6 +1874,16 @@ class BilibiliVideo(BaseVideoUploader):
                             );
                             for (const ov of overlays) {
                                 if (ov.offsetWidth > 0 && ov.offsetHeight > 100) {
+                                    // ═══ 识别永久侧边栏（B站创作中心左侧导航）不要关 ═══
+                                    // 侧边栏包含"投稿/首页/内容管理"等导航链接
+                                    const text = (ov.textContent || '').trim();
+                                    if (text.includes('首页') && text.includes('内容管理') && text.includes('投稿')) {
+                                        return 'permanent_sidebar';  // 永久元素，不要反复尝试关闭
+                                    }
+                                    if (ov.querySelector('nav, .nav, .sidebar, .york_nav')) {
+                                        return 'permanent_sidebar';  // 导航元素，不要关闭
+                                    }
+                                    
                                     // 找弹窗内的关闭/跳过按钮
                                     const btns = ov.querySelectorAll('button, span, a');
                                     for (const btn of btns) {
@@ -1571,12 +1898,17 @@ class BilibiliVideo(BaseVideoUploader):
                                     for (const cb of closeBtns) {
                                         if (cb.offsetWidth > 0) { cb.click(); return 'close-btn'; }
                                     }
-                                    return 'overlay_found_no_button';
+                                    // 没有找到关闭按钮 → 可能是遮罩层但不是弹窗
+                                    return 'overlay_no_action';
                                 }
                             }
                             return null;
                         }""")
-                        if js_closed:
+                        if js_closed == 'permanent_sidebar' or js_closed == 'overlay_no_action':
+                            # 永久侧边栏或无法关闭的遮罩 → 不是需要处理的弹窗，跳过
+                            bilibili_logger.info(_msg("🧹", f"检测到非弹窗元素: {js_closed}，跳过"))
+                            break
+                        elif js_closed:
                             bilibili_logger.info(_msg("🧹", f"JS 关闭弹窗: {js_closed}"))
                             await asyncio.sleep(1)
                         else:
@@ -1706,6 +2038,9 @@ class BilibiliVideo(BaseVideoUploader):
                 # 7. 设置版权类型
                 await self._set_copyright(page, copyright_type=2)
 
+                # 7.5 选择创作声明（B站新增必填项，不填则提交无响应）
+                await self._select_declaration(page)
+
                 # 8. 点击发布
                 # 注意：publish_clicked 只在 _click_publish 不抛异常时才为 True
                 # （_click_publish 找不到按钮会抛 RuntimeError，可重试）
@@ -1727,22 +2062,18 @@ class BilibiliVideo(BaseVideoUploader):
                         await context.close()
                     except Exception:
                         pass
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
                     context = None
-                    browser = None
                     return
 
                 # 成功：更新 cookie
-                await context.storage_state(path=self.account_file)
+                try:
+                    await context.storage_state(path=self.account_file)
+                except Exception:
+                    pass
                 bilibili_logger.success(_msg("🥳", "B站视频发布成功，cookie 已更新"))
                 await asyncio.sleep(2)
                 await context.close()
-                await browser.close()
                 context = None
-                browser = None
                 return  # 成功完成
 
             except Exception as e:
@@ -1757,7 +2088,6 @@ class BilibiliVideo(BaseVideoUploader):
                         pass
                     # 标记已清理，finally 不再重复关闭
                     context = None
-                    browser = None
                     return  # 不重试
 
                 bilibili_logger.warning(_msg("⚠️", f"第 {overall_retry} 轮失败: {e}"))
@@ -1769,15 +2099,10 @@ class BilibiliVideo(BaseVideoUploader):
                     except Exception:
                         pass
             finally:
-                # 清理未关闭的浏览器（成功路径和 publish_clicked 异常路径已自行清理）
+                # 清理未关闭的上下文（成功路径和 publish_clicked 异常路径已自行清理）
                 if context:
                     try:
                         await context.close()
-                    except Exception:
-                        pass
-                if browser:
-                    try:
-                        await browser.close()
                     except Exception:
                         pass
 

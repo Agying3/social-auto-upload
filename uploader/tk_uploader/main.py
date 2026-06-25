@@ -6,17 +6,21 @@ from playwright.async_api import Playwright, async_playwright
 import os
 import asyncio
 from uploader.tk_uploader.tk_config import Tk_Locator
-from utils.base_social_media import set_init_script
+from utils.base_social_media import set_init_script, get_user_data_dir, migrate_storage_state_if_needed
 from utils.files_times import get_absolute_path
 from utils.log import tiktok_logger
 from conf import LOCAL_CHROME_HEADLESS
 
 
 async def cookie_auth(account_file):
+    user_data_dir = get_user_data_dir(account_file)
     async with async_playwright() as playwright:
-        browser = await playwright.firefox.launch(headless=LOCAL_CHROME_HEADLESS)
+        context = await playwright.firefox.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=LOCAL_CHROME_HEADLESS,
+        )
         try:
-            context = await browser.new_context(storage_state=account_file)
+            await migrate_storage_state_if_needed(context, account_file)
             context = await set_init_script(context)
             # 创建一个新的页面
             page = await context.new_page()
@@ -38,7 +42,7 @@ async def cookie_auth(account_file):
                 tiktok_logger.success("[+] cookie valid")
                 return True
         finally:
-            await browser.close()
+            await context.close()
 
 
 async def tiktok_setup(account_file, handle=False):
@@ -52,27 +56,26 @@ async def tiktok_setup(account_file, handle=False):
 
 
 async def get_tiktok_cookie(account_file):
+    user_data_dir = get_user_data_dir(account_file)
     async with async_playwright() as playwright:
-        options = {
-            'args': [
-                '--lang en-GB',
-            ],
-            'headless': LOCAL_CHROME_HEADLESS,  # Set headless option here
-        }
-        # Make sure to run headed.
-        browser = await playwright.firefox.launch(**options)
+        context = await playwright.firefox.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=LOCAL_CHROME_HEADLESS,
+        )
         try:
             # Setup context however you like.
-            context = await browser.new_context()  # Pass any options
             context = await set_init_script(context)
             # Pause the page, and start recording manually.
             page = await context.new_page()
             await page.goto("https://www.tiktok.com/login?lang=en")
             await page.pause()
             # 点击调试器的继续，保存cookie
-            await context.storage_state(path=account_file)
+            try:
+                await context.storage_state(path=account_file)
+            except Exception:
+                pass
         finally:
-            await browser.close()
+            await context.close()
 
 
 class TiktokVideo(object):
@@ -148,11 +151,14 @@ class TiktokVideo(object):
         await file_chooser.set_files(self.file_path)
 
     async def upload(self, playwright: Playwright) -> None:
-        browser = await playwright.firefox.launch(headless=self.headless)
-        context = None
+        user_data_dir = get_user_data_dir(self.account_file)
+        context = await playwright.firefox.launch_persistent_context(
+            user_data_dir=str(user_data_dir),
+            headless=self.headless,
+        )
+        await migrate_storage_state_if_needed(context, self.account_file)
+        context = await set_init_script(context)
         try:
-            context = await browser.new_context(storage_state=f"{self.account_file}")
-            context = await set_init_script(context)
             page = await context.new_page()
 
             await page.goto("https://www.tiktok.com/creator-center/upload")
@@ -185,18 +191,16 @@ class TiktokVideo(object):
 
             await self.click_publish(page)
 
-            await context.storage_state(path=f"{self.account_file}")  # save cookie
+            try:
+                await context.storage_state(path=f"{self.account_file}")  # save cookie
+            except Exception:
+                pass
             tiktok_logger.info('  [-] update cookie！')
             await asyncio.sleep(2)  # close delay for look the video status
         finally:
-            # 确保浏览器被关闭（无论成功还是失败）
-            if context:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
+            # 确保浏览器上下文被关闭（无论成功还是失败）
             try:
-                await browser.close()
+                await context.close()
             except Exception:
                 pass
 

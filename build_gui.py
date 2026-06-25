@@ -647,6 +647,56 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
 .pi-status.error {{ background: rgba(239,68,68,0.18); color: #fca5a5; }}
 .pi-status.pending {{ background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.35); }}
 
+/* ========== 线程配置面板 ========== */
+.thread-config-card {{
+    margin-top: 14px;
+    background: rgba(20,22,30,0.82);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px; padding: 16px 20px;
+}}
+.thread-config-card .tc-header {{
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px;
+}}
+.thread-config-card .tc-title {{
+    font-size: 14px; font-weight: 600; color: rgba(255,255,255,0.7);
+    display: flex; align-items: center; gap: 8px;
+}}
+.thread-count-select {{
+    padding: 5px 10px; border-radius: 8px;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12);
+    color: #fff; font-size: 13px; outline: none; cursor: pointer;
+}}
+.thread-count-select:focus {{ border-color: rgba(99,102,241,0.5); }}
+.thread-assign-list {{
+    display: flex; flex-direction: column; gap: 6px;
+}}
+.thread-row {{
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: rgba(255,255,255,0.04); border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.05);
+    transition: all 0.2s;
+}}
+.thread-row:hover {{ background: rgba(255,255,255,0.06); }}
+.thread-label {{
+    font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.5);
+    min-width: 45px; text-align: right;
+}}
+.platform-thread-select {{
+    padding: 4px 8px; border-radius: 6px; font-size: 12px;
+    background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.8); outline: none; cursor: pointer;
+    min-width: 70px;
+}}
+.platform-thread-select:focus {{ border-color: rgba(99,102,241,0.4); }}
+/* 线程分界线 */
+.progress-thread-divider {{
+    grid-column: 1/-1; padding: 4px 0 2px 0;
+    font-size: 11px; font-weight: 700; color: rgba(255,255,255,0.3);
+    letter-spacing: 1px; border-bottom: 1px solid rgba(255,255,255,0.05);
+    margin-bottom: 4px;
+}}
+
 /* ========== 底部状态栏 ========== */
 .status-bar {{
     position: fixed; bottom: 0; left: 0; right: 0; z-index: 20;
@@ -1769,6 +1819,26 @@ textarea.input-field {{ resize: vertical; min-height: 80px; line-height: 1.6; }}
             <span class="sched-label">定时发布</span>
             <span class="sched-badge" id="schedBadge">关</span>
             <input type="datetime-local" class="datetime-picker" id="datetimePicker">
+        </div>
+    </div>
+
+    <!-- 线程配置面板（选中平台后显示） -->
+    <div class="thread-config-card" id="threadConfigCard" style="display:none;">
+        <div class="tc-header">
+            <div class="tc-title"><span class="icon">⚡</span> 线程配置</div>
+            <div style="display:flex;align-items:center;gap:8px;">
+                <span style="font-size:11px;color:rgba(255,255,255,0.35);">并发数</span>
+                <select class="thread-count-select" id="threadCountSelect" onchange="onThreadCountChange()">
+                    <option value="1">1</option>
+                    <option value="2" selected>2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="5">5</option>
+                </select>
+            </div>
+        </div>
+        <div class="thread-assign-list" id="threadAssignList">
+            <!-- 由 JS 动态生成 -->
         </div>
     </div>
 
@@ -3012,6 +3082,7 @@ function renderPlatformGrid() {{
             }}
             updateStatusBar();
             updateBilibiliZoneCard();
+            updateThreadConfig();
         }};
 
         const statusClass = p.logged_in ? "green" : "red";
@@ -3029,6 +3100,68 @@ function renderPlatformGrid() {{
     }});
 
     updateStatusBar();
+    updateBilibiliZoneCard();
+    updateThreadConfig();
+}}
+
+// ============================================================
+// 线程配置（并发上传分配）
+// ============================================================
+function updateThreadConfig() {{
+    /* 根据 selectedPlatforms 更新线程配置面板 */
+    const card = document.getElementById("threadConfigCard");
+    const list = document.getElementById("threadAssignList");
+    if (!card || !list) return;
+
+    if (selectedPlatforms.length === 0) {{
+        card.style.display = "none";
+        return;
+    }}
+    card.style.display = "block";
+
+    const threadCount = parseInt(document.getElementById("threadCountSelect").value);
+    // 自动轮询分配（保留用户手动修改的值）
+    const autoAssign = {{}};
+    selectedPlatforms.forEach((pid, idx) => {{
+        autoAssign[pid] = (idx % threadCount) + 1;
+    }});
+
+    list.innerHTML = "";
+    selectedPlatforms.forEach(pid => {{
+        const pname = platformData.find(p => p.id === pid)?.name || pid;
+        const currentTid = (_threadAssignCache[pid] !== undefined) ? _threadAssignCache[pid] : (autoAssign[pid] || 1);
+        const row = document.createElement("div");
+        row.className = "thread-row";
+        row.innerHTML = '' +
+            '<span style="font-size:13px;color:rgba(255,255,255,0.7);min-width:60px;">' + pname + '</span>' +
+            '<span style="flex:1;font-size:11px;color:rgba(255,255,255,0.25);">→</span>' +
+            '<select class="platform-thread-select" data-pid="' + pid + '" onchange="onPlatformThreadChange(this)">' +
+            Array.from({{length: threadCount}}, (_, i) => i + 1).map(t =>
+                '<option value="' + t + '"' + (t === currentTid ? ' selected' : '') + '>线程 ' + t + '</option>'
+            ).join("") +
+            '</select>';
+        list.appendChild(row);
+    }});
+}}
+
+// 线程分配缓存
+var _threadAssignCache = {{}};
+function onThreadCountChange() {{
+    _threadAssignCache = {{}};  // 改变线程数时重置
+    updateThreadConfig();
+}}
+function onPlatformThreadChange(selectEl) {{
+    _threadAssignCache[selectEl.dataset.pid] = parseInt(selectEl.value);
+}}
+
+function getThreadAssignment() {{
+    /* 收集当前线程分配 → {{"douyin": 1, "bilibili": 2, ...}} */
+    const result = {{}};
+    const selects = document.querySelectorAll(".platform-thread-select");
+    selects.forEach(s => {{
+        result[s.dataset.pid] = parseInt(s.value);
+    }});
+    return result;
 }}
 
 function updateStatusBar() {{
@@ -4233,15 +4366,26 @@ async function doPublish() {{
 
     const progressList = document.getElementById("progressList");
     progressList.innerHTML = "";
+    // 按线程分组展示进度
+    const threadAssign = getThreadAssignment();
+    const threadGroups = {{}};
     selectedPlatforms.forEach(pid => {{
-        const pname = platformData.find(p=>p.id==pid)?.name || pid;
-        progressList.innerHTML += `
-            <div class="progress-item" id="prog-${{pid}}">
-                <div class="pi-left">
-                    <span>${{pname}}</span>
-                </div>
-                <span class="pi-status pending" id="status-${{pid}}">\\u7B49\\u5F85\\u4E2D...</span>
-            </div>`;
+        const tid = threadAssign[pid] || 1;
+        threadGroups[tid] = threadGroups[tid] || [];
+        threadGroups[tid].push(pid);
+    }});
+    Object.keys(threadGroups).sort((a,b) => a-b).forEach(tid => {{
+        if (Object.keys(threadGroups).length > 1) {{
+            progressList.innerHTML += '<div class="progress-thread-divider">线程 ' + tid + '</div>';
+        }}
+        threadGroups[tid].forEach(pid => {{
+            const pname = platformData.find(p=>p.id==pid)?.name || pid;
+            progressList.innerHTML += ''
+                + '<div class="progress-item" id="prog-' + pid + '">'
+                + '<div class="pi-left"><span>' + pname + '</span></div>'
+                + '<span class="pi-status pending" id="status-' + pid + '">等待中...</span>'
+                + '</div>';
+        }});
     }});
 
     // ---- \\u7981\\u7528\\u6309\\u94AE\\u9632\\u6B62\\u91CD\\u590D\\u70B9\\u51FB ----
@@ -4263,6 +4407,7 @@ async function doPublish() {{
                 platforms: selectedPlatforms,
                 schedule_time: scheduleTime,
                 platform_extra: platformExtra,
+                thread_assignment: getThreadAssignment(),
             }}),
         }});
         const result = await resp.json();
