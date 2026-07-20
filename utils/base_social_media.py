@@ -150,5 +150,5 @@ def build_persistent_launch_kwargs(
     if executable_path or LOCAL_CHROME_PATH:
         kwargs["executable_path"] = executable_path or LOCAL_CHROME_PATH
     else:
-        kwargs["channel"] = "chrome"
+        kwargs["channel"] = "chromium"
     return kwargs

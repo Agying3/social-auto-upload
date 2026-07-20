@@ -697,6 +697,18 @@ class TencentBaseUploader(BaseVideoUploader):
                     await page.keyboard.press("Control+KeyA")
                     await page.keyboard.type(publish_date.strftime("%Y-%m-%d %H:%M"))
                     await page.keyboard.press("Enter")
+                    await page.wait_for_timeout(500)
+                    try:
+                        await page.keyboard.press("Escape")
+                        await page.evaluate("""() => {
+                            const active = document.activeElement;
+                            if (active && typeof active.blur === 'function') active.blur();
+                            const wujieApp = document.querySelector('wujie-app');
+                            const shadowActive = wujieApp && wujieApp.shadowRoot && wujieApp.shadowRoot.activeElement;
+                            if (shadowActive && typeof shadowActive.blur === 'function') shadowActive.blur();
+                        }""")
+                    except Exception:
+                        pass
                     await asyncio.sleep(1)
             else:
                 # 降级方案

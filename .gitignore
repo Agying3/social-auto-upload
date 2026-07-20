@@ -220,6 +220,7 @@ test_*.png
 
 # 测试上传目录
 uploads/
+.data/
 
 # 工作区记忆（WorkBuddy 内部）
 .workbuddy/

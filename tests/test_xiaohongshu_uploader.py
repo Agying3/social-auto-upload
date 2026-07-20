@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +90,29 @@ class RecordingPage:
 
 
 class XiaohongshuUploaderTests(unittest.TestCase):
+    def test_creator_urls_keep_xiaohongshu_domain_by_default(self):
+        with patch.dict(os.environ, {"SAU_XHS_CREATOR_BASE_URL": ""}):
+            self.assertEqual(
+                xhs_main._build_xhs_creator_url("/login"),
+                "https://creator.xiaohongshu.com/login",
+            )
+
+    def test_creator_urls_use_configured_rednote_domain(self):
+        with patch.dict(
+            os.environ,
+            {"SAU_XHS_CREATOR_BASE_URL": "https://creator.rednote.com/"},
+        ):
+            self.assertEqual(
+                xhs_main._build_xhs_creator_url("/login"),
+                "https://creator.rednote.com/login",
+            )
+            self.assertEqual(
+                xhs_main._build_xhs_creator_url(
+                    "/publish/publish?from=homepage&target=video"
+                ),
+                "https://creator.rednote.com/publish/publish?from=homepage&target=video",
+            )
+
     def test_find_xhs_qrcode_locator_prefers_scan_sibling_inside_login_box(self):
         qrcode_locator = FakeLocator("qrcode", count=1, src="data:image/png;base64,abc")
         scan_text_locator = FakeLocator(
@@ -219,7 +243,7 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
         self.assertEqual(
             page.locators['#creator-editor-topic-container .item'].actions,
-            [("wait_for", {"state": "visible", "timeout": 2000}), ("click",)],
+            [("wait_for", {"state": "visible", "timeout": 4000}), ("click",)],
         )
 
     def test_video_fill_meta_can_fill_first_tag_without_desc(self):
@@ -240,6 +264,21 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         )
         self.assertNotIn(("type", "", None), page.keyboard.actions)
         self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
+
+    def test_video_fill_meta_can_fill_multiple_tags(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=["话题1", "话题2"],
+            publish_date=0,
+            account_file="account.json",
+        )
+        page = RecordingPage()
+
+        asyncio.run(app.fill_meta(page))
+
+        self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
+        self.assertIn(("type", "#话题2", 30), page.keyboard.actions)
 
     def test_note_title_defaults_do_not_override_explicit_title(self):
         app = xhs_main.XiaoHongShuNote(

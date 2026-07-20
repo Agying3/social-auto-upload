@@ -6,9 +6,19 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import sau_cli
+import uploader.douyin_uploader.main as douyin_main
 
 
 class BrowserCliParserTests(unittest.TestCase):
+    def test_douyin_verify_code_can_be_read_from_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            code_path = Path(tmp_dir) / "verify_code.txt"
+            code_path.write_text("123456\n", encoding="utf-8")
+
+            code = asyncio.run(douyin_main._read_verify_code(str(code_path)))
+
+        self.assertEqual(code, "123456")
+
     def test_build_parser_accepts_xiaohongshu_login(self):
         parser = sau_cli.build_parser()
         args = parser.parse_args(["xiaohongshu", "login", "--account", "creator"])

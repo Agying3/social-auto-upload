@@ -75,7 +75,7 @@ sau xiaohongshu upload-note --account <account_name> --images videos/1.png video
 ```bash
 sau bilibili login --account <account_name>
 sau bilibili check --account <account_name>
-sau bilibili upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tid 249 --tags 足球,测试
+sau bilibili upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tid 249 --tags 足球,测试 --thumbnail covers/demo.png
 ```
 
 补充说明：
@@ -89,6 +89,7 @@ sau bilibili upload-video --account <account_name> --file videos/demo.mp4 --titl
 - 如果本地没有 `biliup`，第一次运行会自动下载
 - 如果上游 GitHub Release 有更新，运行时会先自动更新
 - `sau bilibili login --account <name>` 建议由用户自己在本地真实终端里执行；如果终端里的二维码显示不完整，可直接打开当前目录下的 `qrcode.png` 扫码
+- 小红书创作者中心域名可用环境变量 `SAU_XHS_CREATOR_BASE_URL` 覆盖，例如 `https://creator.rednote.com`
 
 ## 登录二维码说明
 
